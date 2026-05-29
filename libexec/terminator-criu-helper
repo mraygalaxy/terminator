@@ -554,14 +554,16 @@ def cmd_restore(owner_uid: int, owner_gid: int, ckpt_dir: str,
         c.opts.config_file = cfg_path
         c.opts.external.append("mnt[]:ms")
         c.opts.mntns_compat_mode = True
-        # Allow CRIU to handle the captured TCP sockets, but mark them
-        # closed on restore rather than trying to revive the kernel
-        # socket state. The remote peer is gone (often across a reboot),
-        # so the app needs to reconnect anyway — surfacing that as a
-        # clean closed-socket is friendlier than a half-alive ghost
-        # connection that fails on the next read/write.
+        # Rebuild captured TCP sockets in ESTABLISHED state via kernel
+        # TCP repair. The remote peer is long gone after a reboot, but
+        # leaving the socket alive lets the app discover the failure
+        # through its normal error-handling path: the next HTTP/2 PING
+        # or TCP keepalive probe will get RST, deliver EPOLLERR, and
+        # the runtime sees ECONNRESET like any other network blip.
+        # An invisible CLOSE-state transition (tcp_close) skips that
+        # event entirely and leaves event-loop runtimes (e.g. Bun)
+        # wedged on epoll_wait with nothing to wake them.
         c.opts.tcp_established = True
-        c.opts.tcp_close = True
         c.opts.log_level = 4
         c.opts.log_file = "restore.log"
         c.opts.display_stats = True
