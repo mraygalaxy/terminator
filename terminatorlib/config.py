@@ -282,7 +282,38 @@ DEFAULTS = {
                 # restore, so the visible history is preserved across
                 # checkpoints. True by default; turn off if you prefer
                 # restored tabs to start with a clean screen.
-                'checkpoint_restore_scrollback': True
+                'checkpoint_restore_scrollback': True,
+                # When a tab's checkpoint fails (either at dump time, or
+                # at restore time in a way Python can detect), re-launch
+                # the original command line on next start instead of
+                # falling back to the profile's default shell. True by
+                # default so the user's working program comes back even
+                # when CRIU couldn't preserve its state.
+                'restart_failed_checkpoint': True,
+                # When restarting a fresh program after a checkpoint
+                # failure (above), also feed the saved scrollback buffer
+                # above the new program output. Off by default — the
+                # scrollback is from a *different* process than the one
+                # just restarted, which can be confusing. Only honored
+                # when `checkpoint_restore_scrollback` is also on.
+                'restart_failed_checkpoint_scrollback': False,
+                # Skip the "some tabs could not be checkpointed"
+                # confirmation dialog on window close and proceed
+                # straight to the Close Anyway branch. Set by the
+                # "Remember this choice" checkbox in that dialog; can
+                # be re-disabled here. False by default so the user
+                # always sees the dialog the first time.
+                'close_anyway_on_checkpoint_failure': False,
+                # On Close Anyway, send SIGHUP to each failing tab's
+                # foreground process group and wait up to this many
+                # seconds for the processes to exit gracefully before
+                # the normal close cascade tears them down. 0 disables
+                # the feature (no SIGHUP, no wait — the kernel's pty
+                # close still delivers SIGHUP, just without the grace
+                # period). 3 seconds is comfortable for most apps
+                # (config flushes, transcript saves, RPC goodbyes)
+                # without being annoying.
+                'graceful_kill_timeout_seconds': 3
             },
         },
         'layouts': {

@@ -30,7 +30,12 @@ def _find_helper():
     Dev mode: if terminator is being run from a source checkout (no
     `setup.py install` yet), look for the helper in the sibling
     libexec/ directory of the repo so the feature is testable
-    without installing. Installed paths win when both exist.
+    without installing. Installed paths win when both exist —
+    sudoers only allows the installed path, so a source-tree helper
+    would just fail at the sudo gate. Editing the helper during
+    development requires re-syncing to the installed path
+    (typically `sudo cp libexec/terminator-criu-helper
+    /usr/local/bin/`).
     """
     # 1. Installed paths (production).
     for p in _HELPER_CANDIDATES:
@@ -129,6 +134,57 @@ def checkpoint_dir_for_uuid(uuid_hex):
     return os.path.join(base, "terminator-criu", "checkpoints", uuid_hex)
 
 
+# Marker the helper writes ONLY on a fully-successful dump. Its
+# presence in ckpt_dir means "this is a complete, restorable checkpoint";
+# absence means either a fresh dir or a failed-dump dir.
+TTY_META_FILENAME = "tty_meta.json"
+
+# Where _save_scrollback writes its file alongside CRIU images. Kept
+# in this module so the restart-fresh path knows where to look without
+# importing terminal.py.
+SCROLLBACK_FILENAME = "scrollback.txt"
+
+
+def is_complete_checkpoint(ckpt_dir):
+    """Return True iff ckpt_dir contains a fully-restorable checkpoint
+    (i.e. the helper wrote tty_meta.json). Failed-dump dirs that we
+    preserved scrollback in return False."""
+    return os.path.isfile(os.path.join(ckpt_dir, TTY_META_FILENAME))
+
+
+def wipe_failed_checkpoint(ckpt_dir):
+    """Clean up after a failed dump: remove every file except the
+    pre-dump scrollback so the optional `restart_failed_checkpoint_
+    scrollback` path can still read it back. If no scrollback was
+    saved, removes the directory entirely.
+
+    Safe to call when ckpt_dir doesn't exist.
+    """
+    if not os.path.isdir(ckpt_dir):
+        return
+    scrollback_path = os.path.join(ckpt_dir, SCROLLBACK_FILENAME)
+    has_scrollback = os.path.isfile(scrollback_path)
+    if not has_scrollback:
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
+        return
+    # Keep scrollback, drop everything else (criu .img files, dump.log,
+    # stats files, any partial tty_meta from a previous successful run).
+    try:
+        for name in os.listdir(ckpt_dir):
+            if name == SCROLLBACK_FILENAME:
+                continue
+            victim = os.path.join(ckpt_dir, name)
+            try:
+                if os.path.isdir(victim) and not os.path.islink(victim):
+                    shutil.rmtree(victim, ignore_errors=True)
+                else:
+                    os.unlink(victim)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _state_dir():
     """Return $XDG_STATE_HOME/terminator-criu (created if needed).
 
@@ -210,7 +266,7 @@ class CriuClient(object):
 
     # ----- spawn ----------------------------------------------------------
 
-    def spawn(self, slave_path, program_argv, env=None,
+    def spawn(self, slave_path, program_argv, env=None, cwd=None,
               owner_uid=None, owner_gid=None, timeout=10.0):
         """Ask the privileged helper to fork+exec `program_argv` inside
         a fresh PID + mount namespace, attached to `slave_path` (the
@@ -219,6 +275,10 @@ class CriuClient(object):
         `env` is an optional dict of KEY=VALUE that the helper writes
         to a temp file and uses verbatim as the exec env (with HOME /
         USER / SHELL etc. backfilled if missing).
+
+        `cwd` is an optional working directory to chdir into before
+        exec. If unset, or if the path doesn't exist at exec time,
+        the helper falls back to the user's HOME.
 
         Returns a SpawnResult on success. Raises CriuSpawnError if the
         helper isn't installed, exits before reporting a PID, or times
@@ -262,6 +322,8 @@ class CriuClient(object):
                "--state-dir", state_dir]
         if env_file_path:
             cmd.extend(["--env-file", env_file_path])
+        if cwd:
+            cmd.extend(["--cwd", cwd])
         cmd.append("--")
         cmd.extend(program_argv)
 

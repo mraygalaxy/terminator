@@ -635,6 +635,26 @@ class PrefsEditor:
         # Companion: replay VTE buffer on restore. Defaults to True.
         widget = guiget('checkpoint_restore_scrollback_checkbutton')
         widget.set_active(bool(self.config['checkpoint_restore_scrollback']))
+        # Fallback: re-launch the original command line when CRIU
+        # checkpoint or restore fails. Defaults to True.
+        widget = guiget('restart_failed_checkpoint_checkbutton')
+        widget.set_active(bool(self.config['restart_failed_checkpoint']))
+        # Also replay scrollback when running the fallback restart path.
+        # Defaults to False (scrollback is from a different process).
+        widget = guiget('restart_failed_checkpoint_scrollback_checkbutton')
+        widget.set_active(bool(self.config['restart_failed_checkpoint_scrollback']))
+        # Skip the close-failure confirmation dialog and proceed
+        # with close-anyway semantics. Set by the dialog's "Remember"
+        # checkbox; surfaced here so the user can disable it again.
+        widget = guiget('close_anyway_on_checkpoint_failure_checkbutton')
+        widget.set_active(bool(self.config['close_anyway_on_checkpoint_failure']))
+        # Grace period (seconds) before forcibly killing failing tabs
+        # on close. 0 = no SIGHUP, no wait.
+        widget = guiget('graceful_kill_timeout_spinbutton')
+        widget.set_value(int(self.config['graceful_kill_timeout_seconds']))
+        # Apply the cascade greyout rules now that all boxes are
+        # populated. From here on, each toggle handler re-runs this.
+        self._update_checkpoint_sensitivity()
         # Use Custom command
         widget = guiget('use_custom_command_checkbutton')
         widget.set_active(self.config['use_custom_command'])
@@ -952,6 +972,37 @@ class PrefsEditor:
         self.config['allow_bold'] = widget.get_active()
         self.config.save()
 
+    def _update_checkpoint_sensitivity(self):
+        """Cascade greyout for the CRIU checkbox group.
+
+        Dependency graph:
+            checkpoint_enabled
+                ├── restart_failed_checkpoint
+                │       └── restart_failed_checkpoint_scrollback*
+                ├── checkpoint_restore_scrollback
+                │       └── restart_failed_checkpoint_scrollback*
+                └── close_anyway_on_checkpoint_failure
+            (* the leaf needs BOTH scrollback-side parents on)
+        Greying out instead of hiding keeps the layout stable as the
+        user explores their options.
+        """
+        guiget = self.builder.get_object
+        cp = guiget('checkpoint_enabled_checkbutton').get_active()
+        rsb = guiget('checkpoint_restore_scrollback_checkbutton').get_active()
+        rfc = guiget('restart_failed_checkpoint_checkbutton').get_active()
+        guiget('checkpoint_restore_scrollback_checkbutton').set_sensitive(cp)
+        guiget('restart_failed_checkpoint_checkbutton').set_sensitive(cp)
+        guiget('close_anyway_on_checkpoint_failure_checkbutton').set_sensitive(cp)
+        # Inner leaf: both the parent (restart fallback) AND the
+        # overall scrollback preference have to be on.
+        guiget('restart_failed_checkpoint_scrollback_checkbutton') \
+            .set_sensitive(cp and rfc and rsb)
+        # Grace-period spinner (and its label) only matter when
+        # checkpointing is on at all — without it, no checkpoint
+        # can fail, so there's nothing to wait on.
+        guiget('graceful_kill_timeout_label').set_sensitive(cp)
+        guiget('graceful_kill_timeout_spinbutton').set_sensitive(cp)
+
     def on_checkpoint_enabled_checkbutton_toggled(self, widget):
         """Per-profile CRIU checkpoint-enabled default changed. Only
         affects new tabs spawned with this profile — existing tabs
@@ -959,6 +1010,7 @@ class PrefsEditor:
         in the right-click menu can flip an individual tab)."""
         self.config['checkpoint_enabled'] = widget.get_active()
         self.config.save()
+        self._update_checkpoint_sensitivity()
 
     def on_checkpoint_restore_scrollback_checkbutton_toggled(self, widget):
         """Per-profile flag: whether CRIU restore replays the saved
@@ -967,6 +1019,40 @@ class PrefsEditor:
         restore time, leaving you with the underlying process state
         and a clean screen."""
         self.config['checkpoint_restore_scrollback'] = widget.get_active()
+        self.config.save()
+        self._update_checkpoint_sensitivity()
+
+    def on_restart_failed_checkpoint_checkbutton_toggled(self, widget):
+        """Per-profile flag: when a tab's checkpoint or restore fails
+        in a Python-detectable way, fall back to re-launching the
+        original command line instead of the profile's default shell.
+        Default True."""
+        self.config['restart_failed_checkpoint'] = widget.get_active()
+        self.config.save()
+        self._update_checkpoint_sensitivity()
+
+    def on_restart_failed_checkpoint_scrollback_checkbutton_toggled(self, widget):
+        """Per-profile flag: also replay scrollback when running the
+        fallback restart path. Default False. Only honored when
+        `checkpoint_restore_scrollback` is also True."""
+        self.config['restart_failed_checkpoint_scrollback'] = widget.get_active()
+        self.config.save()
+        self._update_checkpoint_sensitivity()
+
+    def on_close_anyway_on_checkpoint_failure_checkbutton_toggled(self, widget):
+        """Per-profile flag: skip the close-failure confirmation
+        dialog and proceed with close-anyway semantics. Normally set
+        by the "Remember this choice" checkbox in that dialog;
+        surfaced here so the user can re-enable the prompt."""
+        self.config['close_anyway_on_checkpoint_failure'] = widget.get_active()
+        self.config.save()
+        self._update_checkpoint_sensitivity()
+
+    def on_graceful_kill_timeout_spinbutton_value_changed(self, widget):
+        """Per-profile: seconds to wait after SIGHUP'ing failing tabs
+        before letting the normal close cascade tear them down.
+        0 disables both the SIGHUP and the wait."""
+        self.config['graceful_kill_timeout_seconds'] = int(widget.get_value())
         self.config.save()
 
     def on_show_titlebar_toggled(self, widget):

@@ -23,6 +23,9 @@ try:
     from .criu.client import CriuOperationError as _CriuOperationError
     from .criu.client import Status as _CriuStatus
     from .criu.client import checkpoint_dir_for_uuid as _criu_ckpt_dir_for_uuid
+    from .criu.client import wipe_failed_checkpoint as _criu_wipe_failed
+    from .criu.client import is_complete_checkpoint as _criu_is_complete
+    from .criu.client import SCROLLBACK_FILENAME as _CRIU_SCROLLBACK_FILENAME
     _criu_client = _CriuClient()
 except ImportError:
     _CriuClient = None
@@ -30,6 +33,9 @@ except ImportError:
     _CriuOperationError = None
     _CriuStatus = None
     _criu_ckpt_dir_for_uuid = None
+    _criu_wipe_failed = None
+    _criu_is_complete = None
+    _CRIU_SCROLLBACK_FILENAME = None
     _criu_client = None
 try:
     from urllib.parse import unquote as urlunquote
@@ -160,6 +166,25 @@ class Terminal(Gtk.VBox):
     # OR a CRIU restore — used by the child-exited cleanup to decide
     # whether to delete the checkpoint dir.
     _criu_active = False
+
+    # The argv and cwd that this tab was launched with via the CRIU
+    # helper. Used by the failed-checkpoint / failed-restore restart
+    # path to re-launch the same program. None for non-CRIU tabs.
+    _criu_spawn_argv = None
+    _criu_spawn_cwd = None
+
+    # When the most recent CRIU dump for this tab failed AND the user
+    # accepted close-anyway, this holds the metadata needed to restart
+    # the program fresh on next launch. Set by criu_checkpoint_all_tabs
+    # via the window close flow; consumed by describe_layout to emit
+    # the `criu_restart` marker in session.json.
+    _criu_failed_restart_info = None
+
+    # Counterpart of _criu_failed_restart_info on the load side: set by
+    # create_layout when the layout entry carries criu_restart=...,
+    # consumed by spawn_child to fork the saved argv (under the
+    # `restart_failed_checkpoint` profile flag) and feed the banner.
+    _criu_pending_restart = None
 
     # GTK handler id for our always-on `child-exited` cleanup handler.
     # Tracked here (not in Signalman) so we can disconnect on
@@ -329,9 +354,54 @@ class Terminal(Gtk.VBox):
 
     def close(self):
         """Close ourselves"""
+        # For the CRIU + wedge-detection popup we need to know what
+        # was running BEFORE we send SIGHUP (TIOCGPGRP and /proc reads
+        # may stop working once the fg process is killed), and we need
+        # a window to parent the eventual dialog against (close-term
+        # propagation can detach the terminal from its parent chain
+        # mid-flight). Capture both now, while everything is still
+        # intact.
+        wedge_program_name = None
+        wedge_parent_window = None
+        if self._criu_active and self.checkpoint_enabled:
+            toplevel = self.get_toplevel()
+            if isinstance(toplevel, Gtk.Window):
+                wedge_parent_window = toplevel
+            try:
+                fg_argv, _ = self._criu_foreground_argv_and_cwd()
+                if fg_argv:
+                    wedge_program_name = fg_argv[0]
+            except Exception:
+                pass
         dbg('close: called')
         self.cnxids.remove_widget(self.vte)
         self.emit('close-term')
+        # For CRIU tabs, hit the foreground program directly first.
+        # The existing SIGHUP-to-self.pid below only reaches the shell;
+        # if a wedged program (e.g. claude-code's Bun runtime hanging
+        # on a Promise) is the foreground, bash doesn't propagate
+        # SIGHUP to it and the kernel pty-close cascade is too late
+        # to give it a real chance to clean up. Honors the same
+        # `graceful_kill_timeout_seconds` profile knob used by the
+        # window-close failure path. 0 disables the extra wait.
+        if self._criu_active and self.checkpoint_enabled and self.pid is not None:
+            try:
+                grace = int(self.config['graceful_kill_timeout_seconds'])
+            except (KeyError, ValueError, TypeError):
+                grace = 0
+            if grace > 0:
+                cleanly_exited = self._criu_graceful_kill_wait(grace)
+                if not cleanly_exited and wedge_parent_window is not None:
+                    # Process never exited despite SIGHUP — almost
+                    # certainly a wedged CRIU-restored runtime. Defer
+                    # the popup to fire after this close completes so
+                    # we don't show a dialog while teardown is in
+                    # flight; the parent window stays alive (we're
+                    # only closing one tab in it).
+                    GLib.idle_add(self._criu_show_wedge_popup,
+                                  wedge_parent_window,
+                                  wedge_program_name or 'the program',
+                                  grace)
         if self.pid is not None:
             try:
                 dbg('close: killing %d' % self.pid)
@@ -1755,6 +1825,269 @@ class Terminal(Gtk.VBox):
             err('CRIU: failed to restore scrollback from %s: %s'
                 % (path, e))
 
+    def _criu_feed_restart_banner(self, pending_restart):
+        """Tell the user what happened, in the freshly-restarted tab.
+
+        Runs on the restart-fresh path (criu_restart marker from the
+        layout, OR an in-session CRIU restore failure). Order of feeds:
+          1. Saved scrollback — IFF both `restart_failed_checkpoint_
+             scrollback` AND `checkpoint_restore_scrollback` are on,
+             AND a scrollback.txt exists. The scrollback came from a
+             DIFFERENT process than the one we just restarted, so it's
+             off-by-default.
+          2. Explanatory banner — always, regardless of profile flags,
+             because the tab the user is looking at is not the tab
+             they left and they need to know.
+          3. Drop the scrollback.txt now that we've consumed it (or
+             skipped it). Keeps the on-disk state matching the user's
+             mental model of "this tab is fresh now".
+
+        pending_restart: dict with optional 'reason' / 'argv' keys.
+        """
+        # Step 1: optional scrollback. We don't gate this on the
+        # criu_restart presence — even on an in-session restore
+        # failure the scrollback.txt was written pre-dump.
+        ckpt_dir = (_criu_ckpt_dir_for_uuid(self.uuid.hex)
+                    if _criu_ckpt_dir_for_uuid is not None else None)
+        replay_scrollback = (
+            self.config['restart_failed_checkpoint_scrollback']
+            and self.config['checkpoint_restore_scrollback']
+        )
+        if replay_scrollback and ckpt_dir:
+            self._restore_scrollback(ckpt_dir)
+        # Step 2: banner. Two newlines around it so it stands out from
+        # any scrollback above and the program's first output below.
+        reason = (pending_restart.get('reason') or '').strip()
+        argv = pending_restart.get('argv') or []
+        argv_str = ' '.join(argv) if argv else '(no recorded argv)'
+        lines = [
+            '',
+            '*** Terminator: previous CRIU checkpoint could not be used ***',
+        ]
+        if reason:
+            lines.append('    Reason: %s' % reason.splitlines()[-1])
+        if self.config['restart_failed_checkpoint'] and argv:
+            lines.append('    The original command line was re-launched:')
+            lines.append('      %s' % argv_str)
+        elif not self.config['restart_failed_checkpoint']:
+            lines.append('    Per profile setting, the tab was dropped '
+                         'to the default shell instead of re-launching '
+                         '"%s".' % argv_str)
+        if not replay_scrollback:
+            lines.append('    Scrollback from before is NOT being '
+                         'replayed (see profile settings to opt in).')
+        lines.append('')
+        banner = '\r\n'.join(lines) + '\r\n'
+        try:
+            self.vte.feed(banner.encode('utf-8'))
+        except Exception as e:
+            err('CRIU: failed to feed restart banner: %s' % e)
+        # Step 3: consume the on-disk artifacts now. The tab is fresh
+        # and the next checkpoint (if any) will rebuild the dir.
+        if ckpt_dir and os.path.isdir(ckpt_dir):
+            try:
+                import shutil as _sh
+                _sh.rmtree(ckpt_dir, ignore_errors=True)
+            except Exception as e:
+                err('CRIU: failed to wipe consumed restart dir %s: %s'
+                    % (ckpt_dir, e))
+
+    @staticmethod
+    def _criu_read_proc_cmdline(pid):
+        """Read /proc/<pid>/cmdline and return it as a list of strings,
+        or None if it can't be read. Used to capture both the shell
+        (self.pid) and the foreground program at checkpoint-failure
+        time so the restart-fresh path knows what to relaunch and
+        what to fall back to once the program exits."""
+        if not pid:
+            return None
+        try:
+            with open('/proc/%d/cmdline' % pid, 'rb') as f:
+                raw = f.read()
+        except (OSError, IOError):
+            return None
+        if not raw:
+            return None
+        parts = raw.rstrip(b'\0').split(b'\0')
+        return [p.decode('utf-8', errors='replace') for p in parts]
+
+    def _criu_sighup_foreground_pgrp(self):
+        """Send SIGHUP to this tab's foreground process group, so a
+        running program (codex, vim, ssh, etc.) gets a chance to
+        clean up before the normal pty-close cascade tears it down.
+
+        Returns the list of host PIDs we want to observe for exit
+        (typically just the fg pgrp leader and self.pid, the shell).
+        Empty on best-effort failures — callers should treat the
+        return as the set of PIDs to poll for graceful exit.
+
+        Why both: the kernel's pty-close cascade SIGHUPs the fg pgrp
+        anyway, but it does so AFTER GTK teardown is already in
+        motion. Sending SIGHUP up front gives the program a real
+        window (the configured grace period) to react before we
+        proceed with close.
+        """
+        import signal as _signal
+        observe = []
+        try:
+            import fcntl, struct, termios
+            pty_obj = self.vte.get_pty()
+            master_fd = pty_obj.get_fd() if pty_obj else -1
+            if master_fd >= 0:
+                buf = bytearray(4)
+                fcntl.ioctl(master_fd, termios.TIOCGPGRP, buf)
+                pgid = struct.unpack('i', bytes(buf))[0]
+                if pgid > 0:
+                    try:
+                        os.killpg(pgid, _signal.SIGHUP)
+                        observe.append(pgid)
+                    except OSError as e:
+                        dbg('CRIU: SIGHUP to pgrp %d failed: %s'
+                            % (pgid, e))
+        except Exception as e:
+            dbg('CRIU: foreground SIGHUP setup failed: %s' % e)
+        # Also signal the shell (PID-namespace root) so it gets a
+        # chance to write history etc. — only if it's not already in
+        # the fg pgrp we just signalled.
+        if self.pid and self.pid not in observe:
+            try:
+                os.kill(self.pid, _signal.SIGHUP)
+                observe.append(self.pid)
+            except OSError as e:
+                dbg('CRIU: SIGHUP to shell %d failed: %s'
+                    % (self.pid, e))
+        return observe
+
+    @staticmethod
+    def _criu_show_wedge_popup(parent_window, program_name, grace_s):
+        """Non-modal info dialog shown after a manual close where the
+        CRIU tab's foreground program didn't respond to SIGHUP within
+        the configured grace period. Static because by the time the
+        idle callback fires, the terminal instance is being destroyed.
+
+        Returns False so GLib drops this idle entry after one call.
+        """
+        body = _(
+            "%(prog)s did not exit within the %(grace)d-second grace "
+            "period after right-clicking close. This usually means a "
+            "CRIU-restored process got wedged at the application "
+            "level — common for runtimes like Node or Bun holding "
+            "streaming network connections.\n\n"
+            "If you re-launch %(prog)s, consider opening the new tab "
+            "with checkpointing turned off: right-click the new tab "
+            "→ uncheck \"Checkpoint capable\". The setting persists "
+            "for that specific tab across terminator restarts.\n\n"
+            "The %(grace)d-second wait time can be changed in "
+            "Preferences → Profile → Command → \"Grace period before "
+            "forcibly killing tabs whose checkpoint failed\". Set it "
+            "to 0 to skip the wait (and this message) entirely."
+        ) % {'prog': program_name, 'grace': grace_s}
+        dlg = Gtk.MessageDialog(
+            transient_for=parent_window,
+            modal=False,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=_("Tab was unresponsive on close"),
+            secondary_text=body,
+        )
+        dlg.connect('response', lambda d, _r: d.destroy())
+        dlg.show()
+        return False
+
+    def _criu_graceful_kill_wait(self, timeout_s):
+        """SIGHUP this tab's foreground pgrp (and the shell, if it's
+        not already in the fg pgrp) and poll /proc until those PIDs
+        exit or `timeout_s` elapses. Used by manual close on a CRIU
+        tab so a wedged program gets a real grace window before the
+        existing shell-SIGHUP + pty teardown cascade finishes it off.
+
+        Pumps the GLib main context during the wait so the GUI stays
+        responsive.
+
+        Returns True if all observed PIDs exited within the timeout
+        (the clean case) or there was nothing to observe. Returns
+        False if any PID is still alive when the timeout elapses —
+        the caller treats that as evidence of a wedged program.
+        """
+        pids = self._criu_sighup_foreground_pgrp()
+        if not pids:
+            return True
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            still_alive = False
+            for pid in pids:
+                if pid > 0 and os.path.isdir('/proc/%d' % pid):
+                    still_alive = True
+                    break
+            if not still_alive:
+                return True
+            ctx = GLib.MainContext.default()
+            while ctx.pending():
+                ctx.iteration(False)
+            time.sleep(0.05)
+        # Final check after the loop ends — a process that exited
+        # right at the deadline shouldn't get flagged as wedged.
+        for pid in pids:
+            if pid > 0 and os.path.isdir('/proc/%d' % pid):
+                return False
+        return True
+
+    def _criu_foreground_argv_and_cwd(self):
+        """Return (argv, cwd) for the restart-fresh path, or
+        (None, None) if it can't be determined.
+
+        argv: the foreground process group leader's cmdline — i.e.
+              the program the user is currently interacting with.
+              If no child program is running, that's the shell itself
+              (bash / zsh / fish / etc.) and we pick up its argv. If
+              a program like vim/codex is running, we pick up its
+              argv instead. Shell-independent: we use only the
+              POSIX tty foreground-pgrp ioctl + procfs, never any
+              shell-specific state.
+
+        cwd:  ALWAYS the shell's cwd (the PID-namespace root we
+              spawned, stored on self.pid). This is the user's "I
+              navigated to here" intent — `cd /some/dir` updates
+              the shell's cwd. We deliberately ignore the foreground
+              program's cwd because programs sometimes chdir
+              internally (e.g. to a temp dir for a subcommand) and
+              that's not where the user wants to be on next launch.
+              Even when the shell IS the foreground, this resolves
+              to the same dir, so we never need a special case.
+        """
+        try:
+            import fcntl, struct, termios
+            pty_obj = self.vte.get_pty()
+            if pty_obj is None:
+                return (None, None)
+            master_fd = pty_obj.get_fd()
+            if master_fd < 0:
+                return (None, None)
+            buf = bytearray(4)
+            fcntl.ioctl(master_fd, termios.TIOCGPGRP, buf)
+            pgid = struct.unpack('i', bytes(buf))[0]
+            if pgid <= 0:
+                return (None, None)
+            argv = None
+            try:
+                with open('/proc/%d/cmdline' % pgid, 'rb') as f:
+                    raw = f.read()
+            except (OSError, IOError):
+                raw = b''
+            if raw:
+                parts = raw.rstrip(b'\0').split(b'\0')
+                argv = [p.decode('utf-8', errors='replace') for p in parts]
+            cwd = None
+            if self.pid:
+                try:
+                    cwd = os.readlink('/proc/%d/cwd' % self.pid)
+                except (OSError, IOError):
+                    cwd = None
+            return (argv, cwd)
+        except Exception as e:
+            dbg('CRIU: foreground program detection failed: %s' % e)
+            return (None, None)
+
     def _criu_auto_checkpoint(self):
         """Take a fresh CRIU snapshot of this tab for an automatic
         trigger (window close, OS shutdown, sleep, idle kick).
@@ -1798,10 +2131,44 @@ class Terminal(Gtk.VBox):
             _criu_client.dump(self.pid, ckpt_dir, leave_running=True)
             dbg('CRIU auto-checkpoint: dumped tab %s to %s'
                 % (self.uuid, ckpt_dir))
+            # Clear any stale failed-restart marker from a previous
+            # attempt — this dump succeeded, so the tab is back on the
+            # CRIU-restore path.
+            self._criu_failed_restart_info = None
             return True
         except Exception as e:
             err('CRIU auto-checkpoint failed for tab %s: %s'
                 % (self.uuid, e))
+            # Wipe CRIU images/log but keep the pre-dump scrollback so
+            # the optional restart-fresh path can replay it later. The
+            # exception message already carries the log tail the user
+            # would need to debug. Stash the failure reason on the
+            # terminal for the window-close dialog to surface.
+            # Prefer the *currently foreground* program over the
+            # original spawn shell: a user who opened a bash tab and
+            # then ran `codex` wants codex back, not a fresh bash.
+            fg_argv, fg_cwd = self._criu_foreground_argv_and_cwd()
+            restart_argv = fg_argv or list(self._criu_spawn_argv or [])
+            restart_cwd = fg_cwd or self._criu_spawn_cwd or self.cwd
+            # Also record the underlying shell (the PID-namespace
+            # root, self.pid). If the foreground at checkpoint time
+            # was a program rather than the shell itself, the restart
+            # path will wrap it as `shell -c 'prog; exec shell'` so
+            # exiting the program drops the user into a shell instead
+            # of closing the whole tab.
+            shell_argv = self._criu_read_proc_cmdline(self.pid)
+            self._criu_failed_restart_info = {
+                'argv': restart_argv,
+                'shell_argv': shell_argv or list(self._criu_spawn_argv or []),
+                'cwd': restart_cwd,
+                'title': self.titlebar.get_custom_string() or '',
+                'reason': str(e),
+            }
+            if _criu_wipe_failed is not None:
+                try:
+                    _criu_wipe_failed(ckpt_dir)
+                except Exception:
+                    pass
             return False
 
     def _criu_cleanup_on_child_exited(self, _vte, _status):
@@ -1925,8 +2292,16 @@ class Terminal(Gtk.VBox):
         # path itself. The PTY pair stays alive because VTE has master.
         os.close(slave_fd)
 
-        # Step 3: convert envv list to dict for the helper's env-file.
-        env = {}
+        # Step 3: build the env-file dict for the helper. We deliberately
+        # start from os.environ (terminator's own inherited environment)
+        # so PATH, locale, $XDG_*, $DISPLAY, $SSH_AUTH_SOCK, etc. all
+        # flow through to the spawned program — matching what VTE does
+        # in the non-CRIU spawn path (its `envv` list there is ADDITIONS
+        # to terminator's env, not a replacement). Without this, a
+        # binary the user expected to find on PATH (e.g. `claude` in
+        # ~/.local/bin) goes missing inside the namespace because the
+        # helper's setdefault PATH is the minimal system one.
+        env = dict(os.environ)
         for kv in envv or ():
             if '=' in kv:
                 k, v = kv.split('=', 1)
@@ -1941,15 +2316,24 @@ class Terminal(Gtk.VBox):
         # normal exec).
         program_argv = list(args[1:])
         try:
-            result = _criu_client.spawn(slave_path, program_argv, env=env)
+            result = _criu_client.spawn(slave_path, program_argv,
+                                        env=env, cwd=self.cwd)
         except _CriuSpawnError as e:
             # The helper failed before we got a PID. VTE has the
-            # foreign pty attached but with no process on the slave —
-            # detach so the fallback spawn can allocate its own.
+            # foreign PTY attached but with no process on the slave.
+            # We need to replace it so the fallback VTE spawn has a
+            # usable PTY to land on. AVOID `set_pty(None)` — it
+            # segfaults inside VTE 0.76 when the foreign PTY never
+            # had a child attached (no observable Python exception,
+            # the C side just dies). Transition to a fresh
+            # VTE-allocated PTY instead, which sidesteps the bad
+            # None-transition path entirely.
             try:
-                self.vte.set_pty(None)
-            except Exception:
-                pass
+                fresh_pty = Vte.Pty.new_sync(Vte.PtyFlags.DEFAULT, None)
+                self.vte.set_pty(fresh_pty)
+            except Exception as detach_err:
+                err('CRIU spawn cleanup: fresh PTY swap failed: %s'
+                    % detach_err)
             os.close(master_fd)
             self._feed_error(
                 'CRIU helper failed: %s\r\nFalling back to a normal tab.'
@@ -1962,6 +2346,12 @@ class Terminal(Gtk.VBox):
         self.pid = result.host_pid
         self._criu_helper_proc = result.helper_proc
         self._criu_active = True
+        # Remember what we launched so a later failed-checkpoint or
+        # failed-restore path can re-launch the same program (under
+        # the `restart_failed_checkpoint` profile flag) instead of
+        # dropping to the bare profile shell.
+        self._criu_spawn_argv = list(program_argv)
+        self._criu_spawn_cwd = self.cwd
 
         # Tell VTE which PID it's hosting so it fires `child-exited`
         # when bash inside the namespace dies. Without this, typing
@@ -2172,17 +2562,74 @@ class Terminal(Gtk.VBox):
         dbg('Forking shell: "%s" with args: %s' % (shell, args))
         args.insert(0, shell)
 
+        # Failed-checkpoint restart path: a previous session's dump
+        # for this tab failed and the user chose close-anyway. The
+        # layout stashed the original argv/cwd. If the profile flag
+        # is on, override the shell/args/cwd computed above so we
+        # re-launch the same program instead of falling back to the
+        # profile default. The banner that explains what happened is
+        # fed by _criu_feed_restart_banner after the spawn succeeds.
+        pending_restart = self._criu_pending_restart
+        self._criu_pending_restart = None  # one-shot
+        if pending_restart and self.config['restart_failed_checkpoint']:
+            saved_argv = list(pending_restart.get('argv') or [])
+            shell_argv = list(pending_restart.get('shell_argv') or [])
+            if saved_argv:
+                cwd_saved = pending_restart.get('cwd')
+                if cwd_saved:
+                    self.set_cwd(cwd_saved)
+                # If the foreground at checkpoint time WAS the
+                # underlying shell (nothing else running), launch
+                # it directly. Otherwise wrap as `shell -c 'prog
+                # args; exec shell'` so when the program exits the
+                # tab falls back to a shell rather than closing.
+                # Both clauses build args in VTE's FILE_AND_ARGV_ZERO
+                # shape — _spawn_via_criu_helper slices args[1:] back
+                # to the real argv; VTE.spawn_async uses position 0
+                # as the exec path.
+                if shell_argv and saved_argv != shell_argv:
+                    import shlex
+                    inner = (shlex.join(saved_argv)
+                             + '; exec ' + shlex.join(shell_argv))
+                    shell = shell_argv[0]
+                    args = [shell, shell, '-c', inner]
+                else:
+                    shell = saved_argv[0]
+                    args = [shell] + saved_argv
+        elif pending_restart and not self.config['restart_failed_checkpoint']:
+            # User opted out of fallback restart at the profile level.
+            # We still owe them a banner explaining why their tab
+            # isn't what they left it as. Carry the metadata into the
+            # post-spawn feed so the message lands on the bare shell.
+            pass  # banner feed below still runs
+
         # CRIU restore path: a previous session saved a layout that
         # asked for this terminal to be restored from a checkpoint dir.
         # On any failure we feed an error and fall through to normal
-        # spawn so the tab still opens.
-        if self._criu_restore_requested:
+        # spawn so the tab still opens. Skip when we're already on the
+        # restart-fresh path (pending_restart set) — that's a different
+        # marker that means "no checkpoint to restore from".
+        if self._criu_restore_requested and not pending_restart:
             self._criu_restore_requested = False  # one-shot
             if self._restore_via_criu_helper():
                 self.command = shell
                 self.titlebar.update()
                 return
-            # Loud-fallback path: error already fed; continue to normal.
+            # Loud-fallback path: error already fed. Mark this tab as
+            # needing a restart-fresh path because the user-visible
+            # state was lost. The banner feed below will explain.
+            if pending_restart is None:
+                pending_restart = {
+                    'argv': list(self._criu_spawn_argv or []),
+                    'cwd': self._criu_spawn_cwd or self.cwd,
+                    'reason': 'CRIU restore from saved checkpoint failed',
+                }
+                if (pending_restart['argv']
+                        and self.config['restart_failed_checkpoint']):
+                    shell = pending_restart['argv'][0]
+                    args = [shell] + list(pending_restart['argv'])
+                    if pending_restart['cwd']:
+                        self.set_cwd(pending_restart['cwd'])
 
         # CRIU checkpoint-capable spawn path.
         # If this tab is opted in (profile default or per-tab toggle)
@@ -2194,6 +2641,8 @@ class Terminal(Gtk.VBox):
                 # Success — VTE is wired up, helper is running.
                 self.command = shell
                 self.titlebar.update()
+                if pending_restart:
+                    self._criu_feed_restart_banner(pending_restart)
                 return
             # Loud-fallback path: error already fed; continue to normal.
 
@@ -2234,6 +2683,13 @@ class Terminal(Gtk.VBox):
         if self.pid == -1:
             self.vte.feed(_('Unable to start shell:') + shell)
             return -1
+
+        # If we got here via the failed-checkpoint restart-fresh path
+        # AND the spawn was the normal (non-CRIU) VTE path, feed the
+        # banner now. The CRIU-spawn branch already fed its banner
+        # before returning earlier.
+        if pending_restart is not None:
+            self._criu_feed_restart_banner(pending_restart)
 
     def prepare_url(self, urlmatch):
         """Prepare a URL from a VTE match"""
@@ -2424,13 +2880,37 @@ class Terminal(Gtk.VBox):
         layout['uuid'] = self.uuid
         if save_cwd:
             layout['directory'] = self.get_cwd()
-        # If a CRIU checkpoint dir exists on disk for this tab's uuid,
-        # mark the layout entry so the session-load path knows to route
-        # through criu restore instead of a fresh spawn. The dir name
-        # is keyed by uuid (already saved above) so presence flag is
-        # all we need.
-        if (_criu_ckpt_dir_for_uuid is not None
-                and os.path.isdir(_criu_ckpt_dir_for_uuid(self.uuid.hex))):
+        # Persist the per-tab `checkpoint_enabled` override. The popup
+        # menu can flip an individual tab's state independently of its
+        # profile; without saving this, the override is lost across
+        # session restarts and the user has to re-toggle on each
+        # relaunch. Profile changes do NOT retroactively override a
+        # per-tab value once it's saved — that requires opening a new
+        # tab in the layout.
+        if getattr(self, 'checkpoint_enabled', None) is not None:
+            layout['checkpoint_enabled'] = bool(self.checkpoint_enabled)
+        # Persist the original CRIU spawn argv/cwd so a future
+        # restore-failure fallback can re-launch the same program
+        # even though it was originally started in a different run.
+        # Stored at the top level (rather than nested under
+        # criu_restore) so both criu_restore and criu_restart paths
+        # can read it when their happy path falls through.
+        if self._criu_spawn_argv:
+            layout['criu_spawn_argv'] = list(self._criu_spawn_argv)
+        if self._criu_spawn_cwd:
+            layout['criu_spawn_cwd'] = self._criu_spawn_cwd
+        # Decide which CRIU marker (if any) to emit:
+        #   criu_restart  → most recent dump failed; restart fresh on
+        #                   load using the saved argv/cwd. Wins over
+        #                   any leftover checkpoint dir.
+        #   criu_restore  → a complete checkpoint exists on disk and
+        #                   we should route through CRIU restore.
+        # Mutually exclusive; criu_restart takes priority.
+        if self._criu_failed_restart_info:
+            layout['criu_restart'] = dict(self._criu_failed_restart_info)
+        elif (_criu_ckpt_dir_for_uuid is not None
+                and _criu_is_complete is not None
+                and _criu_is_complete(_criu_ckpt_dir_for_uuid(self.uuid.hex))):
             layout['criu_restore'] = True
         name = 'terminal%d' % count
         count = count + 1
@@ -2455,17 +2935,36 @@ class Terminal(Gtk.VBox):
             self.directory = layout['directory']
         if 'uuid' in layout and layout['uuid'] != '':
             self.uuid = make_uuid(layout['uuid'])
-        # If the saved layout requested a CRIU restore, latch the flag
-        # so spawn_child routes through _restore_via_criu_helper. Only
-        # act if the checkpoint dir still exists on disk — otherwise
-        # silently fall through to a fresh spawn.
-        if layout.get('criu_restore') and _criu_ckpt_dir_for_uuid is not None:
+        # Per-tab override of the profile's checkpoint_enabled default.
+        # Whatever the layout saved wins over the profile setting for
+        # this specific tab — that's the whole point of the popup-menu
+        # toggle being persistent.
+        if 'checkpoint_enabled' in layout:
+            self.checkpoint_enabled = bool(layout['checkpoint_enabled'])
+        # Carry the original argv/cwd through restarts so a future
+        # restore-failure can still re-launch the same program.
+        if layout.get('criu_spawn_argv'):
+            self._criu_spawn_argv = list(layout['criu_spawn_argv'])
+        if layout.get('criu_spawn_cwd'):
+            self._criu_spawn_cwd = layout['criu_spawn_cwd']
+        # CRIU markers (mutually exclusive — described in
+        # describe_layout above):
+        #   criu_restart → previous dump failed but user chose
+        #                  close-anyway. Re-launch the saved argv.
+        #   criu_restore → full checkpoint exists; restore via CRIU.
+        if layout.get('criu_restart'):
+            # Stash the info for spawn_child to consume. The actual
+            # decision about whether to re-launch (vs profile shell)
+            # and whether to replay scrollback is made there, against
+            # the live profile flags.
+            self._criu_pending_restart = dict(layout['criu_restart'])
+        elif layout.get('criu_restore') and _criu_ckpt_dir_for_uuid is not None:
             ckpt_dir = _criu_ckpt_dir_for_uuid(self.uuid.hex)
-            if os.path.isdir(ckpt_dir):
+            if _criu_is_complete is not None and _criu_is_complete(ckpt_dir):
                 self._criu_restore_requested = True
             else:
-                dbg('CRIU: layout asked for restore but dir is gone: %s'
-                    % ckpt_dir)
+                dbg('CRIU: layout asked for restore but dir is gone '
+                    'or incomplete: %s' % ckpt_dir)
 
     def scroll_by_page(self, pages):
         """Scroll up or down in pages"""

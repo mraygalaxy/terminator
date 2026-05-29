@@ -3,11 +3,12 @@
 """window.py - class for the main Terminator window"""
 
 import copy
+import os
 import time
 import uuid
 import gi
 from gi.repository import GObject
-from gi.repository import Gtk, Gdk
+from gi.repository import Gtk, Gdk, GLib
 
 from .util import dbg, err, make_uuid, display_manager
 
@@ -291,27 +292,234 @@ class Window(Container, Gtk.Window):
             dbg('unknown child: %s' % child)
             veto = False  # close anyway
 
-        # If we're letting close proceed, snapshot the CRIU session NOW —
+        # If we're letting close proceed, run CRIU checkpoint NOW —
         # before GTK fires 'destroy' and tears down the widget tree
         # (which is too late: by then self.terminator.describe_layout()
-        # returns {}). Also set the preserve flag so the child-exited
-        # cleanup keeps the checkpoint dirs around for restore on next
-        # launch.
+        # returns {}). If any tabs fail to checkpoint, surface a
+        # second dialog that lets the user either cancel the close
+        # entirely (so they can disable checkpointing per-tab) or
+        # proceed with restart-fresh markers in the saved session.
         if not veto:
-            self._criu_save_session_and_preserve_checkpoints()
+            veto = self._criu_checkpoint_close_flow(window)
         return veto
 
-    def _criu_save_session_and_preserve_checkpoints(self):
-        """On window close: tabs in this window are about to die.
-        Delegate to the terminator-wide method which captures all
-        windows' arrangements into session.json — useful for the
-        multi-window case where one window closes while others
-        remain alive.
+    def _criu_checkpoint_close_flow(self, window):
+        """Run CRIU checkpoints for the close path. Returns True to
+        veto the close (user cancelled after seeing failures), False
+        to let it proceed.
+
+        Side effects on the "proceed" path:
+          - failed tabs have `_criu_failed_restart_info` set (already
+            populated by _criu_auto_checkpoint on the dump-failure
+            branch) so describe_layout will emit criu_restart markers
+          - session.json is written with the final layout
+        Side effects on the "veto" path:
+          - failed tabs' partial dump dirs are wiped entirely (so the
+            tab stays running with no stale state on disk)
+          - no session.json is written (the tab is still alive)
         """
         try:
-            self.terminator.criu_checkpoint_all_tabs(preserve_on_exit=True)
+            results = self.terminator.criu_checkpoint_all_tabs(
+                preserve_on_exit=True, save_session=False)
         except AttributeError:
-            pass  # built without CRIU support
+            return False  # built without CRIU support
+        failures = [r for r in results if not r['ok']]
+        if not failures:
+            # All good — save the session and let close proceed.
+            self._criu_save_session()
+            return False
+        # If any failing tab's profile already has "always close
+        # anyway" set (via the dialog's Remember checkbox, or
+        # toggled in preferences), skip the dialog and treat as if
+        # the user just clicked Close Anyway.
+        skip_dialog = any(
+            r['terminal'].config['close_anyway_on_checkpoint_failure']
+            for r in failures
+        )
+        if skip_dialog:
+            self._criu_save_session()
+            return False
+        # Some failed. Build the dialog and ask the user.
+        choice, remember = self._construct_criu_failure_dialog(
+            window, failures)
+        if choice == Gtk.ResponseType.CANCEL:
+            # User wants to keep working. Wipe ONLY the failed tabs'
+            # partial dump dirs (those contain at most scrollback.txt
+            # after _criu_auto_checkpoint's preservation logic — no
+            # restorable checkpoint). Keep successful tabs' dirs on
+            # disk: they're stale the moment the user types into the
+            # tab again, but they're harmless and the orphan sweep on
+            # the eventual close will clean them up. Reset the
+            # preserve-on-exit flag we set preemptively, and clear the
+            # failure markers so re-tries on next close start fresh.
+            try:
+                from .criu.client import (
+                    checkpoint_dir_for_uuid as _ckpt_for_uuid
+                )
+                import shutil as _sh
+                for r in results:
+                    t = r['terminal']
+                    t._criu_preserve_checkpoint_on_exit = False
+                    if not r['ok']:
+                        try:
+                            _sh.rmtree(
+                                _ckpt_for_uuid(t.uuid.hex),
+                                ignore_errors=True)
+                        except Exception:
+                            pass
+                        t._criu_failed_restart_info = None
+            except ImportError:
+                pass
+            return True
+        # User chose "Close anyway". Failed tabs already have their
+        # restart info populated by _criu_auto_checkpoint, and
+        # describe_layout knows to emit criu_restart for them.
+        # If the user ticked "Remember this choice", persist that on
+        # each failing tab's profile so the dialog is skipped next
+        # time around. We set it on every distinct profile referenced
+        # by the failing tabs — not the whole config — so a user
+        # with mixed profiles only opts in the ones that actually
+        # had a failing tab.
+        if remember:
+            try:
+                from .config import Config as _Config
+                seen_profiles = set()
+                for r in failures:
+                    profile_name = r['terminal'].get_profile()
+                    if profile_name in seen_profiles:
+                        continue
+                    seen_profiles.add(profile_name)
+                    cfg = _Config(profile=profile_name)
+                    cfg['close_anyway_on_checkpoint_failure'] = True
+                    cfg.save()
+            except Exception as e:
+                err('Could not persist close-anyway preference: %s' % e)
+        self._criu_graceful_shutdown(failures)
+        self._criu_save_session()
+        return False
+
+    def _criu_graceful_shutdown(self, failures):
+        """SIGHUP each failing tab's foreground pgrp and let them
+        clean up for up to the configured grace period.
+
+        Per-tab profile chooses the timeout; we wait for the LONGEST
+        of the involved profiles, since the wait runs once across
+        all failing tabs in this window. 0 on a tab's profile means
+        "don't bother for this tab" — we skip its SIGHUP.
+        """
+        timeouts = []
+        observe = []  # list of (terminal, pid_to_poll)
+        for r in failures:
+            t = r['terminal']
+            try:
+                grace = int(t.config['graceful_kill_timeout_seconds'])
+            except (KeyError, ValueError, TypeError):
+                grace = 0
+            if grace <= 0:
+                continue
+            timeouts.append(grace)
+            pids = t._criu_sighup_foreground_pgrp()
+            for pid in pids:
+                observe.append((t, pid))
+        if not timeouts:
+            return
+        deadline = time.monotonic() + max(timeouts)
+        # Poll /proc for the SIGHUP'd PIDs while pumping GLib events
+        # so the GUI doesn't freeze. Tight (50ms) tick so observed
+        # graceful exits cut the wait short instead of waiting for
+        # the full window.
+        while time.monotonic() < deadline:
+            still_alive = False
+            for _t, pid in observe:
+                if pid > 0 and os.path.isdir('/proc/%d' % pid):
+                    still_alive = True
+                    break
+            if not still_alive:
+                break
+            ctx = GLib.MainContext.default()
+            while ctx.pending():
+                ctx.iteration(False)
+            time.sleep(0.05)
+
+    def _criu_save_session(self):
+        """Write the current layout to session.json. Idempotent and
+        safe to call even when CRIU isn't installed."""
+        try:
+            from .criu import session as _criu_sess
+            _criu_sess.save(self.terminator.describe_layout(save_cwd=True))
+        except ImportError:
+            pass
+        except Exception as e:
+            err('CRIU session save failed: %s' % e)
+
+    def _construct_criu_failure_dialog(self, parent, failures):
+        """Show the second-line dialog explaining which tabs failed to
+        checkpoint and asking the user whether to close anyway or
+        cancel. Returns (response, remember) where response is one of
+        Gtk.ResponseType.{OK, CANCEL} and remember is True iff the
+        user ticked "Remember this choice" before answering.
+
+        Distinct from `construct_confirm_close` because this fires
+        AFTER the close was already confirmed — it's specifically for
+        the "we tried to checkpoint and some of it didn't work" case.
+        """
+        # Headline + per-tab breakdown. Each failure entry already has
+        # a short reason (the CRIU log tail) which we truncate to keep
+        # the dialog readable.
+        bullets = []
+        for f in failures:
+            t = f['terminal']
+            title = (t.titlebar.get_custom_string()
+                     or getattr(t, 'command', None)
+                     or 'tab %s' % t.uuid.hex[:8])
+            reason = (f['error'] or 'unknown error').strip().splitlines()
+            short_reason = reason[-1] if reason else 'unknown error'
+            bullets.append('  • %s — %s' % (title, short_reason))
+        body = _(
+            'CRIU could not checkpoint the following tab(s):'
+        ) + '\n\n' + '\n'.join(bullets) + '\n\n' + _(
+            'You can:\n'
+            '  • Cancel the close and stay in terminator. You can '
+            'then right-click any failing tab and uncheck '
+            '"Checkpoint capable" so it stops trying. This stays '
+            'remembered for that specific tab across restarts.\n'
+            '  • Close anyway. The failing tabs above will be '
+            're-launched fresh on next start (with the original '
+            'command line), assuming the profile flag '
+            '"Restart the original program if checkpoint fails" '
+            'is enabled. Successful checkpoints from other tabs '
+            'will be restored normally.'
+        )
+        dialog = Gtk.MessageDialog(
+            transient_for=parent,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            text=_('Some tabs could not be checkpointed'),
+            secondary_text=body,
+        )
+        # Pack a "Remember" checkbox into the dialog's content area.
+        # Honored ONLY when the user clicks Close Anyway — choosing
+        # to remember "always cancel" makes no sense (the user
+        # already has the option to not close in the first place).
+        remember_check = Gtk.CheckButton.new_with_mnemonic(
+            _('_Remember this choice (always close anyway when '
+              'checkpoints fail). Reversible in Preferences > '
+              'Profile > Command.'))
+        remember_check.set_margin_top(8)
+        remember_check.set_margin_start(8)
+        remember_check.set_margin_end(8)
+        remember_check.set_margin_bottom(4)
+        content_area = dialog.get_content_area()
+        content_area.pack_start(remember_check, False, False, 0)
+        remember_check.show()
+        dialog.add_button(_('Cancel close'), Gtk.ResponseType.CANCEL)
+        dialog.add_button(_('Close anyway'), Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        response = dialog.run()
+        remember = (response == Gtk.ResponseType.OK
+                    and remember_check.get_active())
+        dialog.destroy()
+        return (response, remember)
 
     def on_destroy_event(self, widget, data=None):
         """Handle window destruction"""

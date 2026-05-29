@@ -215,7 +215,8 @@ def _load_env_file(path: str) -> dict:
 
 
 def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
-              state_dir: str, env_file: str, program_argv: list[str]) -> None:
+              state_dir: str, env_file: str, program_argv: list[str],
+              cwd: str = None) -> None:
     # Diagnostic log goes inside the caller-provided state dir (typically
     # $XDG_RUNTIME_DIR/terminator-criu/) so we don't pollute /tmp and the
     # caller can find it predictably.
@@ -331,7 +332,22 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
     env.setdefault("TERM", os.environ.get("TERM", "xterm-256color"))
-    os.chdir(pw.pw_dir)
+    # Respect the caller-requested cwd if it's still a valid directory
+    # (the user may have rm'd it between sessions, or restart-fresh
+    # may be pointing at a stale path). Fall back to HOME so we never
+    # exec from an undefined cwd. Also reflect the chosen cwd in PWD
+    # so child processes (shells especially) display it correctly.
+    target_cwd = pw.pw_dir
+    if cwd:
+        try:
+            os.stat(cwd)
+            target_cwd = cwd
+        except OSError:
+            print(f"requested cwd {cwd!r} not accessible; "
+                  f"falling back to HOME ({pw.pw_dir})",
+                  file=sys.stderr, flush=True)
+    os.chdir(target_cwd)
+    env["PWD"] = target_cwd
     os.execvpe(program_argv[0], list(program_argv), env)
 
 
@@ -618,6 +634,9 @@ def main() -> None:
                     help="optional KEY=VALUE-per-line file used as the "
                          "exec environment. Identity vars (HOME/USER/SHELL "
                          "etc.) are backfilled if missing.")
+    sp.add_argument("--cwd", default=None,
+                    help="working directory to chdir into before exec. "
+                         "Falls back to HOME if the path doesn't exist.")
     sp.add_argument("argv", nargs="*",
                     help="program and args to exec (default: bash -i)")
 
@@ -653,7 +672,8 @@ def main() -> None:
         cmd_check()
     elif args.cmd == "spawn":
         cmd_spawn(args.uid, args.gid, args.slave, args.pid_file,
-                  args.state_dir, args.env_file, args.argv)
+                  args.state_dir, args.env_file, args.argv,
+                  cwd=args.cwd)
     elif args.cmd == "dump":
         cmd_dump(args.owner_uid, args.owner_gid, args.pid,
                  args.ckpt_dir, args.state_dir, args.leave_running)

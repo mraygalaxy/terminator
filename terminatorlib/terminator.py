@@ -650,9 +650,8 @@ class Terminator(Borg):
 
     last_criu_checkpoint_summary = None
 
-    def criu_checkpoint_all_tabs(self, preserve_on_exit):
-        """Auto-checkpoint every CRIU-active tab across every window
-        and persist the session to disk.
+    def criu_checkpoint_all_tabs(self, preserve_on_exit, save_session=True):
+        """Auto-checkpoint every CRIU-active tab across every window.
 
         preserve_on_exit:
           - True  → the caller expects tabs to die imminently (window
@@ -665,33 +664,46 @@ class Terminator(Borg):
                     via the normal cleanup, which matches the user
                     intent of "clean exit means I'm done".
 
-        No-op when no tab is CRIU-active — we don't auto-write a
-        session.json for users who never opted into checkpointing.
-        Returns the number of tabs that were checkpointed.
+        save_session:
+          - True  → write session.json after all dumps complete
+                    (default). Callers that need to decide on extra
+                    layout fields before saving (e.g. the close-window
+                    dialog adding criu_restart markers) pass False
+                    and call describe_layout/_criu_sess.save themselves.
+
+        Returns a list of {'terminal': t, 'ok': bool, 'error': str}
+        dicts — one per CRIU-active tab in the order they were
+        attempted. The caller decides how to surface failures.
         """
         criu_tabs = [t for t in self.terminals
                      if getattr(t, '_criu_active', False)]
+        results = []
         if not criu_tabs:
-            return 0
+            return results
         if preserve_on_exit:
             for t in criu_tabs:
                 t._criu_preserve_checkpoint_on_exit = True
-        failed = 0
         for t in criu_tabs:
-            if not t._criu_auto_checkpoint():
-                failed += 1
-        try:
-            from .criu import session as _criu_sess
-            _criu_sess.save(self.describe_layout(save_cwd=True))
-        except ImportError:
-            pass
-        except Exception as e:
-            err('CRIU session save failed: %s' % e)
+            ok = bool(t._criu_auto_checkpoint())
+            entry = {'terminal': t, 'ok': ok, 'error': ''}
+            if not ok:
+                info = getattr(t, '_criu_failed_restart_info', None)
+                entry['error'] = (info or {}).get('reason', 'unknown error')
+            results.append(entry)
+        if save_session:
+            try:
+                from .criu import session as _criu_sess
+                _criu_sess.save(self.describe_layout(save_cwd=True))
+            except ImportError:
+                pass
+            except Exception as e:
+                err('CRIU session save failed: %s' % e)
         # Stash a summary so the popup-menu code can surface it as a
         # tooltip — gives users a hint that a background auto-checkpoint
         # (sleep, screen-blank, etc.) succeeded or failed, since they
         # may have been away from the keyboard when it happened.
         import time as _time
+        failed = sum(1 for r in results if not r['ok'])
         self.last_criu_checkpoint_summary = {
             'time':     _time.time(),
             'total':    len(criu_tabs),
@@ -700,7 +712,7 @@ class Terminator(Borg):
         }
         dbg('CRIU: auto-checkpointed %d tab(s) (%d failed; preserve_on_exit=%s)'
             % (len(criu_tabs), failed, preserve_on_exit))
-        return len(criu_tabs)
+        return results
 
     def zoom_in_all(self):
         for term in self.terminals:

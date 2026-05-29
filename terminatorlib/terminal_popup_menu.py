@@ -244,10 +244,48 @@ class TerminalPopupMenu(object):
         terminal._save_scrollback(ckpt_dir)
         try:
             _criu_client.dump(terminal.pid, ckpt_dir, leave_running=True)
+            # Clear any stale failed-restart marker from a previous
+            # attempt — this dump succeeded, so the tab is back on the
+            # CRIU-restore path.
+            terminal._criu_failed_restart_info = None
         except Exception as e:
             terminal._feed_error(
                 'Checkpoint failed: %s' % e
             )
+            # Wipe CRIU images/log but keep the pre-dump scrollback so
+            # the optional restart-fresh path can replay it later. The
+            # exception message above already carries the log tail the
+            # user would need to debug. Stash the failure reason on
+            # the terminal for the close-window dialog to surface.
+            # Prefer the currently foreground program over the
+            # original spawn shell — see the matching comment in
+            # terminal._criu_auto_checkpoint.
+            try:
+                fg_argv, fg_cwd = terminal._criu_foreground_argv_and_cwd()
+            except Exception:
+                fg_argv, fg_cwd = (None, None)
+            restart_argv = fg_argv or list(
+                getattr(terminal, '_criu_spawn_argv', None) or [])
+            restart_cwd = (fg_cwd
+                or getattr(terminal, '_criu_spawn_cwd', None)
+                or terminal.cwd)
+            try:
+                shell_argv = terminal._criu_read_proc_cmdline(terminal.pid)
+            except Exception:
+                shell_argv = None
+            terminal._criu_failed_restart_info = {
+                'argv': restart_argv,
+                'shell_argv': shell_argv or list(
+                    getattr(terminal, '_criu_spawn_argv', None) or []),
+                'cwd': restart_cwd,
+                'title': terminal.titlebar.get_custom_string() or '',
+                'reason': str(e),
+            }
+            try:
+                from .criu.client import wipe_failed_checkpoint
+                wipe_failed_checkpoint(ckpt_dir)
+            except Exception:
+                pass
             return
 
         # Persist the current arrangement to the hidden session file so

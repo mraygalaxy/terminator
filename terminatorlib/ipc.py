@@ -260,11 +260,12 @@ class DBusService(Borg, dbus.service.Object):
         Returns the number of tabs that were checkpointed (0 if none
         were CRIU-active, or if checkpointing isn't installed)."""
         try:
-            return dbus.UInt32(
-                self.terminator.criu_checkpoint_all_tabs(preserve_on_exit=False))
+            results = self.terminator.criu_checkpoint_all_tabs(
+                preserve_on_exit=False)
         except AttributeError:
             # terminator was installed without CRIU support
             return dbus.UInt32(0)
+        return dbus.UInt32(len(results))
 
     @dbus.service.method(BUS_NAME)
     def get_terminals(self):

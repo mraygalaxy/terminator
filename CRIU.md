@@ -46,7 +46,12 @@ unmodified terminator tabs.
 
 A per-tab toggle is also exposed in the right-click menu
 ("Checkpoint c**a**pable") so the user can suppress checkpointing for
-a single tab without flipping the profile-wide default.
+a single tab without flipping the profile-wide default. The per-tab
+override **persists** across session save/load: once a user disables
+checkpointing on a tab and that tab participates in a window-close
+save, the disabled state is recorded in `session.json` and restored on
+next launch. Profile-level changes do *not* retroactively override a
+per-tab setting once it's been explicitly saved.
 
 ## Triggers — when checkpoints are taken or consumed
 
@@ -60,7 +65,8 @@ a single tab without flipping the profile-wide default.
 | **Screen lock / blank** (`org.freedesktop.ScreenSaver.ActiveChanged`) | Same as laptop sleep | keeps running |
 | **`Ctrl-C` on terminator's launching shell** | Same as window close | dies |
 | **External DBus call** (`criu_checkpoint_all` on net.tenshu.Terminator2) | Same as laptop sleep | keeps running |
-| **Restore on next launch** (session.json present, no `--layout` given) | Spawn each tab via `criu restore`; consume each dump dir | recreated |
+| **Right-click → Close on a single tab** | Send SIGHUP to fg pgrp, wait up to `graceful_kill_timeout_seconds`, wipe that tab's checkpoint dir | dies |
+| **Restore on next launch** (session.json present, no `--layout` given) | Spawn each tab via `criu restore` (or, on `criu_restart` markers, freshly relaunch the saved argv); consume each dump dir | recreated |
 
 Auto-save lifecycle hooks (close, shutdown, sleep, screensaver, etc.)
 are no-ops when no tab in the window is currently CRIU-active —
@@ -165,15 +171,18 @@ make a restored tab feel continuous, we capture the VTE buffer
 alongside the CRIU dump and replay it on restore:
 
 - **Save**: just before each `criu dump`, write
-  `<ckpt_dir>/scrollback.vte` using
+  `<ckpt_dir>/scrollback.txt` using
   `Vte.Terminal.write_contents_sync(stream, WriteFlags.DEFAULT)`.
   That format is VTE's own contents stream — colors, cursor positions,
   attributes — designed to be fed back into another VTE instance.
 - **Restore**: after `vte.set_pty(...)` but before
   `criu_client.restore()` (so the buffer is populated *before* the
-  resumed process writes anything new), read `scrollback.vte` and
+  resumed process writes anything new), read `scrollback.txt` and
   `vte.feed(bytes)`. The historical view appears in the new tab, then
-  fresh output from the restored process appends after.
+  fresh output from the restored process appends after. Bytes are
+  CRLF-normalized first because `write_contents_sync` emits LF-only
+  line terminators, which VTE would otherwise interpret as "move down
+  one row, same column" — producing a diagonal staircase.
 
 A per-profile toggle (**Preferences → Profile → Command → "Restore
 scrollback history on checkpoint restore"**,
@@ -188,7 +197,8 @@ starts with a clean screen on top of the underlying process state.
 | Purpose | Location |
 |---|---|
 | CRIU dump images per tab (persistent across reboots) | `$XDG_DATA_HOME/terminator-criu/checkpoints/<tab-uuid>/` |
-| Saved VTE buffer for each checkpoint | `$XDG_DATA_HOME/terminator-criu/checkpoints/<tab-uuid>/scrollback.vte` |
+| Saved VTE buffer for each checkpoint | `$XDG_DATA_HOME/terminator-criu/checkpoints/<tab-uuid>/scrollback.txt` |
+| Marker that a dump completed cleanly (presence = restorable) | `$XDG_DATA_HOME/terminator-criu/checkpoints/<tab-uuid>/tty_meta.json` |
 | Auto-saved session (hidden, one-shot, consumed on next launch) | `$XDG_DATA_HOME/terminator-criu/session.json` |
 | Helper diagnostic log, transient state | `$XDG_STATE_HOME/terminator-criu/helper.log` |
 
@@ -239,6 +249,118 @@ What downstream packagers may want to do:
   them. `setup.py`'s auto-detection skips the CRIU files entirely if
   they're not present at build time.
 
+## Failure handling
+
+Not every process can be checkpointed. CRIU bails on programs that use
+features it doesn't understand (`io_uring` shared mappings, certain
+exotic socket types), and even successful CRIU dumps can produce
+restored processes that are alive at the kernel level but wedged at the
+application level (notably JavaScript runtimes that swallowed an
+unhandled Promise rejection during the dump/restore window). The
+integration handles these gracefully rather than pretending nothing
+happened.
+
+**Dump-time failures (window close).** When the user closes a window,
+each CRIU tab is checkpointed in turn. If any fail, a second dialog
+appears listing the failing tab(s) and the underlying reason (the CRIU
+log tail). Two buttons:
+
+- **Cancel close** — veto the close. Tabs stay running; partial dump
+  dirs from the failing tabs are wiped, so right-clicking a failing
+  tab and unchecking "Checkpoint capable" leaves it in a clean state
+  for next time.
+- **Close anyway** — proceed. Successful tabs are restored normally
+  on next launch; failing tabs get a `criu_restart` marker in
+  `session.json` (with the original argv + cwd + foreground program
+  name captured via `TIOCGPGRP`-on-master + `/proc/<pgid>/cmdline`).
+
+The dialog has a **"Remember this choice"** checkbox; ticking it
+before Close Anyway sets `close_anyway_on_checkpoint_failure=True` on
+every distinct profile that had a failing tab, so the dialog is skipped
+next time. Reversible from Preferences → Profile → Command.
+
+**Restart-fresh path on next launch.** A `criu_restart` marker tells
+the load path: re-launch the original program with its original argv,
+in its original cwd, but as a fresh process (no CRIU state). If the
+foreground at checkpoint time was a *child* of the shell (e.g. `codex`
+running inside bash), the relaunch is wrapped as `shell -c 'prog;
+exec shell'` — so when the program exits, the tab survives and the
+user lands at a fresh shell instead of the tab closing entirely. POSIX
+shell semantics, works for bash/zsh/fish/dash.
+
+A small explanatory banner is fed into the VTE on top of the relaunched
+program: "previous CRIU checkpoint could not be used — reason — original
+command line was re-launched." Optional scrollback replay on this path
+is off by default (see preferences) because the saved buffer belongs to
+a *different* process than the one freshly launched, which can be
+confusing.
+
+**Restore-time failures.** If `criu restore` itself raises (Python-
+detectable failure, distinct from "alive but wedged" — see limitations
+below), the tab's `pending_restart` is synthesized from the saved
+`criu_spawn_argv`/`criu_spawn_cwd` layout fields and the same banner +
+restart-fresh path runs.
+
+**Manual close of a wedged tab.** When the user right-clicks → Close
+on a CRIU tab whose program isn't responding (e.g. a wedged restored
+runtime that won't take Ctrl-C), `terminal.close()`:
+
+1. Reads the foreground pgid from the master pty via `TIOCGPGRP`,
+   sends SIGHUP to that pgrp (plus to the shell if it's not in the
+   fg pgrp).
+2. Polls `/proc` for those PIDs, pumping GLib events so the GUI stays
+   responsive, until either everything exits or
+   `graceful_kill_timeout_seconds` elapses.
+3. Proceeds with the existing close cascade (shell SIGHUP + 500ms
+   bash-history-loss safety wait + pty teardown).
+
+If the grace period elapses without the program exiting, a non-modal
+info dialog fires advising the user that this was probably a wedged
+restore and recommending they uncheck "Checkpoint capable" on the
+next tab that runs the same program. The dialog references the
+specific program name and the active grace value, and points at the
+preference to change or disable the behavior.
+
+## Preferences reference
+
+All per-profile, under **Preferences → Profile → Command**. The
+cascade greyout reflects the dependency chain — child rows are
+disabled when their parent is off.
+
+| Setting | Default | Description |
+|---|---|---|
+| Enable checkpoint/restore (CRIU) for tabs in this profile | Off | Master switch. Without it, none of the rows below take effect. |
+| Restart the original program if checkpoint or restore fails | On | Fall back to relaunching the original argv (with shell wrap) instead of dropping to the profile's default shell. |
+| Restore scrollback history on checkpoint restore | On | Replay the captured VTE buffer when a CRIU restore succeeds. |
+| Also replay scrollback when restarting after a failed checkpoint | Off | Replay scrollback on the *restart-fresh* path. Gated on the row above — scrollback belongs to a different process than the one being relaunched. |
+| Always close anyway when checkpoints fail (skip the confirmation dialog) | Off | Auto-set by the dialog's Remember checkbox; surfaced here so the user can re-enable the prompt. |
+| Grace period before forcibly killing tabs whose checkpoint failed (seconds, 0 = off) | 3 | SIGHUP foreground pgrp on close + wait up to this many seconds. Applies to both window-close (with failing tabs) and manual right-click close. 0 disables the SIGHUP-and-wait path entirely. |
+
+## Known program-class limitations
+
+Confirmed through testing of the integration. These are limitations of
+CRIU and/or specific runtimes — the integration detects and degrades
+gracefully but can't make them work:
+
+- **OpenAI Codex CLI (Rust + io_uring)** — dump fails at the parse
+  stage with `Unknown shit 600 (anon_inode:[io_uring])`. CRIU 4.2
+  doesn't grok io_uring shared submission/completion queue mappings.
+  The dump failure is clean (process unfrozen, source still running);
+  the user sees the failure dialog. Restart-fresh on next launch
+  works fine.
+- **Claude Code (Bun runtime)** — dump succeeds. Restore succeeds
+  mechanically: process tree intact, threads scheduling, TTY paired
+  correctly, foreground program reading bytes from stdin. But the
+  JS-side render reducer wedges, awaiting a Promise that depended on
+  the captured-then-killed API socket. No kernel-layer fix is
+  possible. The manual-close popup is designed to catch exactly this
+  case post-mortem and recommend disabling checkpointing for the
+  tab.
+- **General pattern**: complex TUI apps with active streaming network
+  state and modern async runtimes (Node, Bun, eventually anything
+  using io_uring at scale) are fragile under c/r. Native shells,
+  vim/emacs, less, ssh, REPLs (Python, Ruby, etc.) work reliably.
+
 ## Notes on intentional design choices
 
 **The hidden session captures the *whole* arrangement, not just CRIU
@@ -266,6 +388,23 @@ keyboard, the toggle's tooltip carries a "Last auto-checkpoint: N
 tab(s), Xs/m/h ago, OK | M FAILED" footer so subsequent right-clicks
 expose what happened. Failure detail still goes to stderr and
 `$XDG_STATE_HOME/terminator-criu/helper.log`.
+
+## Dev workflow note: helper sync
+
+Edits to `libexec/terminator-criu-helper` do **not** take effect on
+their own. The sudoers fragment only allows the installed binary at
+`/usr/local/bin/terminator-criu-helper`, so `_find_helper()`
+deliberately prefers the installed path over the source tree. After
+every helper edit, sync to the installed path:
+
+```
+sudo cp libexec/terminator-criu-helper /usr/local/bin/terminator-criu-helper
+```
+
+If you installed via `setup.py install`, the helper also lives inside
+the egg under `EGG-INFO/scripts/terminator-criu-helper`. Sync there
+too if you're testing via `/usr/local/bin/terminator` rather than
+`python3 ./terminator` from the source tree.
 
 ## Dev: running the integration tests
 

@@ -309,6 +309,13 @@
     <property name="step-increment">1</property>
     <property name="page-increment">10</property>
   </object>
+  <object class="GtkAdjustment" id="graceful_kill_timeout_adjustment">
+    <property name="lower">0</property>
+    <property name="upper">30</property>
+    <property name="value">3</property>
+    <property name="step-increment">1</property>
+    <property name="page-increment">5</property>
+  </object>
   <object class="GtkListStore" id="ScrollbarPositionListStore">
     <columns>
       <!-- column-name Position -->
@@ -2209,6 +2216,25 @@
                           </packing>
                         </child>
                         <child>
+                          <object class="GtkCheckButton" id="restart_failed_checkpoint_checkbutton">
+                            <property name="label" translatable="yes">_Restart the original program if checkpoint or restore fails</property>
+                            <property name="use-action-appearance">False</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="tooltip-text" translatable="yes">When a tab's checkpoint cannot be created (e.g. the program uses io_uring or other state CRIU cannot snapshot) or its restore fails on next launch, fall back to launching the original command line fresh, instead of dropping back to the profile's default shell. The program loses its state but the tab keeps doing what you originally asked it to do.</property>
+                            <property name="use-underline">True</property>
+                            <property name="xalign">0</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="on_restart_failed_checkpoint_checkbutton_toggled" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">5</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
                           <object class="GtkCheckButton" id="checkpoint_restore_scrollback_checkbutton">
                             <property name="label" translatable="yes">Restore _scrollback history on checkpoint restore</property>
                             <property name="use-action-appearance">False</property>
@@ -2223,8 +2249,74 @@
                           </object>
                           <packing>
                             <property name="left-attach">0</property>
-                            <property name="top-attach">5</property>
+                            <property name="top-attach">6</property>
                             <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="restart_failed_checkpoint_scrollback_checkbutton">
+                            <property name="label" translatable="yes">Also replay s_crollback when restarting after a failed checkpoint</property>
+                            <property name="use-action-appearance">False</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="tooltip-text" translatable="yes">When the fallback restart path runs (above), also feed the previously-saved scrollback buffer above the freshly-launched program. Off by default because the scrollback comes from a *different* process than the one being restarted, which can be confusing. Only honored when "Restore scrollback history" above is also enabled.</property>
+                            <property name="use-underline">True</property>
+                            <property name="xalign">0</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="on_restart_failed_checkpoint_scrollback_checkbutton_toggled" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">7</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="close_anyway_on_checkpoint_failure_checkbutton">
+                            <property name="label" translatable="yes">_Always close anyway when checkpoints fail (skip the confirmation dialog)</property>
+                            <property name="use-action-appearance">False</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="tooltip-text" translatable="yes">When set, the window-close path skips the "some tabs could not be checkpointed" confirmation dialog and proceeds directly with close-anyway semantics. Normally set by the "Remember this choice" checkbox in that dialog; uncheck here to start seeing the dialog again.</property>
+                            <property name="use-underline">True</property>
+                            <property name="xalign">0</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="on_close_anyway_on_checkpoint_failure_checkbutton_toggled" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">8</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="graceful_kill_timeout_label">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Grace period before forcibly killing tabs whose checkpoint failed (seconds, 0 = off):</property>
+                            <property name="xalign">0</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">9</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="graceful_kill_timeout_spinbutton">
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="tooltip-text" translatable="yes">When closing a window after some tabs failed to checkpoint, send SIGHUP to those tabs' foreground process group and wait up to this many seconds for them to exit gracefully before the normal close cascade tears them down. Set 0 to disable the grace period entirely (the kernel still sends SIGHUP via the pty close, just without the wait). 1 second is enough for most well-behaved apps to flush state.</property>
+                            <property name="adjustment">graceful_kill_timeout_adjustment</property>
+                            <property name="numeric">True</property>
+                            <property name="snap-to-ticks">True</property>
+                            <property name="update-policy">if-valid</property>
+                            <signal name="value-changed" handler="on_graceful_kill_timeout_spinbutton_value_changed" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">1</property>
+                            <property name="top-attach">9</property>
                           </packing>
                         </child>
                       </object>
