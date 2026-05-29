@@ -151,17 +151,88 @@ between operations.
 
 ## Mount-namespace discipline
 
-The helper marks `/` as `MS_REC|MS_SLAVE` immediately after
+The helper marks `/` as `MS_REC|MS_PRIVATE` immediately after
 `unshare(CLONE_NEWNS)` so mounts inside the namespace cannot propagate
 back to the host. This is non-negotiable: skipping it once corrupted
 the host `/proc` mount table during PoC development.
 
-The helper also prunes inherited host mounts (`/sys`, `/run`, `/snap`,
-etc.) from its own namespace before CRIU runs — CRIU's mount engine
-struggles with the modern systemd mount tree (snap loops in particular
-cause "external slavery" errors). The prune is done via
-`umount2(MNT_DETACH)` via `ctypes` so it works regardless of which
-`umount(8)` is on `PATH` and never touches the host.
+The policy is **opt-out, not opt-in**. `unshare(CLONE_NEWNS)` clones
+the entire host mount tree into the new namespace automatically —
+every host mount is inherited by default. The helper then surgically
+removes a small list of mounts that break CRIU's dump/restore engine,
+and that's it. Anything not on that list stays mounted; we never
+enumerate what to keep, because we can't (the kernel gave us
+everything already).
+
+So the question to ask when CRIU fails on a new system is always
+"which specific mount caused this failure?" — not "what do I need to
+add to a keep-list?". The answer goes into the prune list as the
+narrowest possible entry (a path or a path+fstype pair, never a broad
+sledgehammer prefix).
+
+### What we umount and why
+
+| Mount(s) | Why we have to umount it |
+|---|---|
+| `/sys/fs/cgroup` | cgroup2 hierarchy with systemd-managed propagation flags. CRIU's mount engine can't replay this from outside-the-namespace state. |
+| `/run/snapd/ns/*.mnt` | Bind mounts of snap process mount-namespaces (nsfs files). Classic CRIU "external slavery" trigger. Only the `ns/` subtree is targeted — `/run/snapd.socket` (the snap CLI control socket, which lives directly in `/run`) stays reachable, so `snap install` continues to work. |
+| `/run/user/<uid>/doc`, `/run/user/<uid>/gvfs` (only when type matches `fuse.*`) | xdg-document-portal and gvfsd-fuse mounts whose backing daemons live outside our namespace and cannot survive into it. Targeted by **(path prefix, fstype prefix)** so the user's own fuse mounts (sshfs to a project dir, encfs, archivemount, etc.) are NOT touched. |
+| `/proc` | We unmount and re-mount with `mount -t proc proc /proc` so PIDs visible in `/proc/<n>/` match the `unshare(CLONE_NEWPID)` view. |
+
+That's the entire prune set. Nothing else gets touched.
+
+### What that means survives inside the namespace
+
+This is not a curated allowlist — these are just consequences of
+"inherit everything, umount the few entries above." Calling them out
+because each one was either silently broken in an earlier prune-
+heavy revision or is a recurring "why doesn't X work in my tab?"
+question:
+
+- **`/sys`** (except `cgroup`) — `nvidia-smi`, `lspci`, `lsusb`,
+  `sensors`, `acpi`, anything that walks `/sys/class/{net,power_supply,
+  drm,hwmon}` or `/sys/devices`, `/sys/firmware/efi/efivars`,
+  `/sys/kernel/{debug,tracing,security,bpf,config}`, `/sys/fs/pstore`.
+  Critical for hardware-aware CLI work.
+- **`/run`** (except the surgical bits above) — DBus user
+  (`/run/user/<uid>/bus`) and system (`/run/dbus/system_bus_socket`)
+  buses; Wayland socket (`wayland-0`); PulseAudio/PipeWire sockets;
+  gnome-keyring (`keyring/`); `systemctl --user`; **snap CLI**
+  (`/run/snapd.socket`); **avahi mDNS** (`/run/avahi-daemon/socket` —
+  needed by `nss-mdns` for `.local` hostname lookups); systemd-resolved
+  stub-resolv.conf for hosts whose `/etc/resolv.conf` symlinks into
+  `/run/systemd/resolve/`.
+- **`/snap`** — all of `/snap/<name>/<rev>` squashfs bind mounts plus
+  `/snap/bin/*` wrappers. Snap-installed apps (firefox, slack, code,
+  thunderbird, ...) keep launching from CLI.
+- **`/dev/shm`**, **`/dev/mqueue`**, **`/dev/hugepages`** — shared
+  memory tmpfs (browsers, databases, multiprocessing), POSIX message
+  queues, hugetlbfs. Command-line software with shared-memory IPC or
+  huge-page allocations works.
+- **`/boot`**, **`/boot/efi`** — kernel images, GRUB configs, EFI
+  binaries. `update-grub`, `grub-install`, kernel-tweak workflows
+  work as on the host.
+
+### Prune mechanism
+
+Pruning is done via `umount2(MNT_DETACH)` invoked through `ctypes`
+against `libc` directly, not by forking `umount(8)` — both for speed
+and to avoid subprocess-related flakiness when we've already started
+disturbing the mount tree. Order is deepest-first so child mounts go
+before parents. `MS_REC|MS_PRIVATE` on `/` ensures none of this
+propagates back to the host.
+
+### History — why this isn't more aggressive
+
+An earlier version pruned the entire `/sys`, `/run`, `/snap`,
+`/dev/shm`, `/dev/mqueue`, `/dev/hugepages`, `/boot` subtrees. That
+worked for CRIU but silently broke a long list of user-facing things
+(mDNS, DBus, audio, snap CLI, nvidia-smi, browsers, GRUB tooling).
+The current minimum set was reached by enumerating each user-visible
+breakage, identifying which specific inherited mount actually caused
+it, and proving the corresponding sub-mount was safe to keep. The
+"narrow surgical removal" pattern should be how this list grows in
+the future too.
 
 ## Scrollback (visible terminal history) is preserved too
 
@@ -207,11 +278,12 @@ at next startup after its layout has been handed to `create_layout`.
 On consumption, any checkpoint dir whose UUID is not referenced by
 the just-loaded session is treated as orphan and removed.
 
-`$XDG_RUNTIME_DIR` would be the textbook choice for transient state but
-is unsuitable here: the helper prunes `/run` inside its mount namespace
-before invoking CRIU, which makes `/run/user/$UID/...` unreachable to
-the CRIU process. `$XDG_STATE_HOME` (under `/home`) survives the prune
-and matches the XDG semantics for "data that persists between runs but
+`$XDG_RUNTIME_DIR` would be the textbook choice for transient helper
+state, but the helper's diagnostic log needs to survive across reboots
+to be useful for post-mortem debugging — `/run` is a tmpfs and is
+pruned of its problematic sub-mounts inside the namespace anyway.
+`$XDG_STATE_HOME` (under `/home`) lives on persistent storage and
+matches the XDG semantics for "data that persists between runs but
 isn't user-portable" (debug logs).
 
 ## Dependencies summary

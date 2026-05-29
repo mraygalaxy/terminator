@@ -97,103 +97,108 @@ def set_pdeathsig(sig: int) -> None:
         raise OSError(err, os.strerror(err), "prctl(PR_SET_PDEATHSIG)")
 
 
-# Mountpoint prefixes whose entire subtree we prune from the inherited
-# host mount namespace. Everything else (/, /home, /usr, /tmp, /var, /etc,
-# /opt, /mnt, /media) is left intact so bash sees a normal filesystem.
+# Minimum set of mountpoint prefixes whose subtree we prune from the
+# inherited host mount namespace. The goal is to preserve normal
+# desktop functionality inside the namespace (mDNS, DBus, audio,
+# Wayland, snap CLI, hardware tools that read /sys, etc.) while only
+# detaching mounts that actually break CRIU's dump/restore engine.
+#
+# What's pruned and why:
+#   /sys/fs/cgroup — cgroup2 hierarchy with systemd-managed propagation
+#                    flags. CRIU's mount engine cannot replay this from
+#                    outside-the-namespace state.
+#   /run/snapd/ns  — bind mounts of snap process mount namespaces
+#                    (the .mnt nsfs files). CRIU's classic "external
+#                    slavery" trigger. Note we keep /run/snapd itself
+#                    so /run/snapd/snapd.socket stays reachable —
+#                    `snap install` from a CRIU tab keeps working.
+#   /proc          — fresh /proc remounted later so PIDs inside the
+#                    namespace match the unshare(CLONE_NEWPID) view.
+#
+# Notably NOT pruned: /sys (kept — needed by nvidia-smi, lspci, lsusb,
+# sensors, hardware detection), /run (kept — DBus, mDNS/avahi,
+# systemctl --user, Wayland/audio sockets at /run/user/<uid>), /snap
+# (snap apps), /dev/shm, /dev/mqueue, /dev/hugepages, /boot.
+#
+# If a specific sub-mount turns out to cause CRIU failures later, add
+# it here. The right shape is "as narrow as possible to fix the
+# specific failure" — avoid sledgehammer prefixes.
 _PRUNE_PREFIXES = (
-    "/sys",
-    "/run",
-    "/snap",
-    "/boot",
-    "/dev/hugepages",
-    "/dev/mqueue",
-    "/dev/shm",
+    "/sys/fs/cgroup",
+    "/run/snapd/ns",
     "/proc",
 )
 
+# Additional surgical rule for fuse mounts under /run/user/<uid>: the
+# document portal (`/run/user/<uid>/doc`) and gvfs (`.../gvfs`) are
+# FUSE filesystems backed by user-side daemons (xdg-document-portal,
+# gvfsd-fuse) that cannot survive into the CRIU namespace. CRIU
+# refuses to dump processes with fuse mounts visible in their mount
+# tree. We target by (path prefix, fstype prefix) so the user's OWN
+# fuse mounts elsewhere (sshfs to a project dir, encfs, etc.) are
+# left alone.
+_PRUNE_BY_PREFIX_AND_TYPE = (
+    ("/run/user/", "fuse."),
+)
 
-def _enumerate_mounts() -> list[str]:
-    """Read /proc/self/mountinfo and return mountpoints, deepest first.
+
+def _enumerate_mounts() -> list[tuple[str, str]]:
+    """Read /proc/self/mountinfo and return (mountpoint, fstype)
+    tuples, deepest first.
 
     Must be called BEFORE we start unmounting (since unmounting /proc
-    later would invalidate this view)."""
-    mounts: list[str] = []
+    later would invalidate this view).
+
+    mountinfo line format (separated by spaces):
+      <id> <parent_id> <major>:<minor> <root> <mountpoint> <opts> \
+      <optional_fields...> - <fstype> <source> <super_opts>
+    The `-` token separates the always-present prefix from the
+    fs-type tail. Field 5 (index 4) is the mountpoint; the token
+    immediately after `-` is the fstype.
+    """
+    mounts: list[tuple[str, str]] = []
     with open("/proc/self/mountinfo") as f:
         for line in f:
             parts = line.split()
-            if len(parts) < 5:
+            if len(parts) < 8 or "-" not in parts:
                 continue
-            mounts.append(parts[4])
-    mounts.sort(key=lambda p: (p.count("/"), len(p)), reverse=True)
+            sep_idx = parts.index("-")
+            if sep_idx + 1 >= len(parts):
+                continue
+            mounts.append((parts[4], parts[sep_idx + 1]))
+    mounts.sort(key=lambda mp: (mp[0].count("/"), len(mp[0])), reverse=True)
     return mounts
 
 
-def _read_upstream_dns() -> bytes:
-    """Return DNS config bytes to use inside the namespace.
-
-    On systemd-resolved systems /etc/resolv.conf is a symlink to the stub
-    resolver (nameserver 127.0.0.53) which is not running inside the namespace.
-    We want the REAL upstream nameservers from resolv.conf (not stub-resolv.conf).
-    Falls back to /etc/resolv.conf if the upstream file is absent.
-    Must be called BEFORE /run is pruned.
-    """
-    for candidate in (
-        "/run/systemd/resolve/resolv.conf",   # upstream servers, no stub
-        "/run/systemd/resolve/stub-resolv.conf",
-        "/etc/resolv.conf",
-    ):
-        try:
-            real = os.path.realpath(candidate)
-            with open(real, "rb") as f:
-                data = f.read()
-            if data.strip():
-                return data
-        except OSError:
-            continue
-    return b""
-
-
-def _restore_dns_after_prune(content: bytes) -> None:
-    """After /run has been pruned, mount a fresh tmpfs at /run and write
-    the saved DNS content so the /etc/resolv.conf symlink resolves again.
-
-    /etc/resolv.conf → ../run/systemd/resolve/stub-resolv.conf is the
-    canonical symlink on systemd-resolved systems. We recreate just enough
-    of the /run tree to satisfy it. The new /run is a private tmpfs —
-    it never propagates to the host (root is already MS_PRIVATE).
-    """
-    if not content:
-        return
-    try:
-        rc = _libc.mount(b"none", b"/run", b"tmpfs", 0, None)
-        if rc != 0:
-            err = ctypes.get_errno()
-            print(f"  mount tmpfs /run errno={err}", file=sys.stderr, flush=True)
-            return
-        os.makedirs("/run/systemd/resolve", exist_ok=True)
-        stub = "/run/systemd/resolve/stub-resolv.conf"
-        with open(stub, "wb") as f:
-            f.write(content)
-        print("restored /etc/resolv.conf via fresh /run tmpfs", file=sys.stderr, flush=True)
-    except OSError as e:
-        print(f"  resolv restore error: {e}", file=sys.stderr, flush=True)
-
-
 def _prune_inherited_mounts() -> None:
-    """Lazy-unmount every mount under our prune prefixes.
+    """Lazy-unmount every inherited mount that breaks CRIU.
+
+    Two filter rules apply:
+      1. Mountpoint matches one of `_PRUNE_PREFIXES` (or is a child).
+      2. Mountpoint is under one of `_PRUNE_BY_PREFIX_AND_TYPE`'s path
+         prefixes AND its fstype starts with the configured fstype
+         prefix (e.g. fuse mounts under /run/user/).
 
     Uses umount2(MNT_DETACH) directly via libc rather than forking the
     umount(8) binary — both for speed and to avoid subprocess-related
-    flakiness when we've already started disturbing the mount tree."""
-    all_mounts = _enumerate_mounts()
-    for mp in all_mounts:
+    flakiness when we've already started disturbing the mount tree.
+    """
+    for mp, fstype in _enumerate_mounts():
         if mp == "/":
             continue
-        if not any(mp == p or mp.startswith(p + "/") for p in _PRUNE_PREFIXES):
+        prune = False
+        if any(mp == p or mp.startswith(p + "/") for p in _PRUNE_PREFIXES):
+            prune = True
+        else:
+            for path_prefix, type_prefix in _PRUNE_BY_PREFIX_AND_TYPE:
+                if mp.startswith(path_prefix) and fstype.startswith(type_prefix):
+                    prune = True
+                    break
+        if not prune:
             continue
         rc = _libc.umount2(mp.encode(), MNT_DETACH)
         err = ctypes.get_errno() if rc != 0 else 0
-        print(f"  umount2 {mp} rc={rc} errno={err}",
+        print(f"  umount2 {mp} (type={fstype}) rc={rc} errno={err}",
               file=sys.stderr, flush=True)
 
 
@@ -275,15 +280,12 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
     set_pdeathsig(signal.SIGKILL)
     print(f"=== child pid={os.getpid()} starting ===", file=sys.stderr, flush=True)
 
-    # Save upstream DNS before /run disappears, restore after pruning.
-    _dns_content = _read_upstream_dns()
-    # Prune host-inherited mounts. CRIU restore tries to unmount these
-    # one-by-one and fails (e.g. on /sys "Device or resource busy"). Far
-    # easier to give CRIU a minimal namespace to dump in the first place.
-    # Lazy + recursive so nested mounts go too without ordering pain.
+    # Prune host-inherited mounts that break CRIU. Narrow set — see
+    # _PRUNE_PREFIXES for details. /run survives this pass, so the
+    # systemd-resolved stub-resolv.conf symlink (and avahi/dbus/etc.
+    # sockets) continue to work without any DNS restoration dance.
     _prune_inherited_mounts()
     print("pruned mounts ok", file=sys.stderr, flush=True)
-    _restore_dns_after_prune(_dns_content)
 
     # Mount a private /proc so tools inside see only this namespace.
     # Safe to do now that root is MS_PRIVATE — won't propagate to host.
@@ -545,9 +547,7 @@ def cmd_restore(owner_uid: int, owner_gid: int, ckpt_dir: str,
     # restore-target namespace.
     unshare(CLONE_NEWNS)
     make_root_rprivate()
-    _dns_content = _read_upstream_dns()
     _prune_inherited_mounts()
-    _restore_dns_after_prune(_dns_content)
     subprocess.run(
         ["mount", "-t", "proc", "-o", "nosuid,noexec,nodev", "proc", "/proc"],
         check=True,
