@@ -453,6 +453,13 @@ def cmd_dump(owner_uid: int, owner_gid: int, pid: int,
         c.opts.shell_job = True
         c.opts.config_file = cfg_path
         c.opts.external.append("mnt[]:ms")
+        # Snapshot connected TCP sockets via kernel TCP repair. Without
+        # this, CRIU refuses to dump any process holding a live outbound
+        # connection (e.g. Claude Code talking to api.anthropic.com).
+        # The remote peer won't survive the downtime, but the app gets
+        # to discover that on its next read/write instead of us refusing
+        # to checkpoint at all.
+        c.opts.tcp_established = True
         # Leave the dumped process running after the snapshot so the
         # user's tab keeps working post-checkpoint (the dump becomes
         # a restore-point, not the end of the tab). Skip this when
@@ -547,6 +554,14 @@ def cmd_restore(owner_uid: int, owner_gid: int, ckpt_dir: str,
         c.opts.config_file = cfg_path
         c.opts.external.append("mnt[]:ms")
         c.opts.mntns_compat_mode = True
+        # Allow CRIU to handle the captured TCP sockets, but mark them
+        # closed on restore rather than trying to revive the kernel
+        # socket state. The remote peer is gone (often across a reboot),
+        # so the app needs to reconnect anyway — surfacing that as a
+        # clean closed-socket is friendlier than a half-alive ghost
+        # connection that fails on the next read/write.
+        c.opts.tcp_established = True
+        c.opts.tcp_close = True
         c.opts.log_level = 4
         c.opts.log_file = "restore.log"
         c.opts.display_stats = True
