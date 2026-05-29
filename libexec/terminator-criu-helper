@@ -128,6 +128,57 @@ def _enumerate_mounts() -> list[str]:
     return mounts
 
 
+def _read_upstream_dns() -> bytes:
+    """Return DNS config bytes to use inside the namespace.
+
+    On systemd-resolved systems /etc/resolv.conf is a symlink to the stub
+    resolver (nameserver 127.0.0.53) which is not running inside the namespace.
+    We want the REAL upstream nameservers from resolv.conf (not stub-resolv.conf).
+    Falls back to /etc/resolv.conf if the upstream file is absent.
+    Must be called BEFORE /run is pruned.
+    """
+    for candidate in (
+        "/run/systemd/resolve/resolv.conf",   # upstream servers, no stub
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/etc/resolv.conf",
+    ):
+        try:
+            real = os.path.realpath(candidate)
+            with open(real, "rb") as f:
+                data = f.read()
+            if data.strip():
+                return data
+        except OSError:
+            continue
+    return b""
+
+
+def _restore_dns_after_prune(content: bytes) -> None:
+    """After /run has been pruned, mount a fresh tmpfs at /run and write
+    the saved DNS content so the /etc/resolv.conf symlink resolves again.
+
+    /etc/resolv.conf → ../run/systemd/resolve/stub-resolv.conf is the
+    canonical symlink on systemd-resolved systems. We recreate just enough
+    of the /run tree to satisfy it. The new /run is a private tmpfs —
+    it never propagates to the host (root is already MS_PRIVATE).
+    """
+    if not content:
+        return
+    try:
+        rc = _libc.mount(b"none", b"/run", b"tmpfs", 0, None)
+        if rc != 0:
+            err = ctypes.get_errno()
+            print(f"  mount tmpfs /run errno={err}", file=sys.stderr, flush=True)
+            return
+        os.makedirs("/run/systemd/resolve", exist_ok=True)
+        stub = "/run/systemd/resolve/stub-resolv.conf"
+        with open(stub, "wb") as f:
+            f.write(content)
+        print("restored /etc/resolv.conf via fresh /run tmpfs", file=sys.stderr, flush=True)
+    except OSError as e:
+        print(f"  resolv restore error: {e}", file=sys.stderr, flush=True)
+
+
 def _prune_inherited_mounts() -> None:
     """Lazy-unmount every mount under our prune prefixes.
 
@@ -223,12 +274,15 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
     set_pdeathsig(signal.SIGKILL)
     print(f"=== child pid={os.getpid()} starting ===", file=sys.stderr, flush=True)
 
+    # Save upstream DNS before /run disappears, restore after pruning.
+    _dns_content = _read_upstream_dns()
     # Prune host-inherited mounts. CRIU restore tries to unmount these
     # one-by-one and fails (e.g. on /sys "Device or resource busy"). Far
     # easier to give CRIU a minimal namespace to dump in the first place.
     # Lazy + recursive so nested mounts go too without ordering pain.
     _prune_inherited_mounts()
     print("pruned mounts ok", file=sys.stderr, flush=True)
+    _restore_dns_after_prune(_dns_content)
 
     # Mount a private /proc so tools inside see only this namespace.
     # Safe to do now that root is MS_PRIVATE — won't propagate to host.
@@ -468,7 +522,9 @@ def cmd_restore(owner_uid: int, owner_gid: int, ckpt_dir: str,
     # restore-target namespace.
     unshare(CLONE_NEWNS)
     make_root_rprivate()
+    _dns_content = _read_upstream_dns()
     _prune_inherited_mounts()
+    _restore_dns_after_prune(_dns_content)
     subprocess.run(
         ["mount", "-t", "proc", "-o", "nosuid,noexec,nodev", "proc", "/proc"],
         check=True,
