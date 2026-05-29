@@ -1,0 +1,192 @@
+#!/bin/bash
+# Terminator by Chris Jones <cmsj@tenshu.net>
+# GPL v2 only
+#
+# terminator-criu-setup - Configure the system to use the CRIU
+# checkpoint/restore integration.
+#
+# The base `python3 setup.py install` (or your distro's terminator
+# package) places this script and the privileged helper on the system,
+# but does NOT touch /etc/sudoers.d or create system groups — those are
+# admin decisions. Run this script ONCE as root to opt in:
+#
+#     sudo terminator-criu-setup
+#
+# It will:
+#   1. Detect the installed helper (e.g. /usr/local/bin/terminator-criu-helper).
+#   2. Create the `terminator-criu` system group if missing.
+#   3. Add the invoking user (or $INSTALL_FOR_USER) to the group.
+#   4. Validate and install /etc/sudoers.d/terminator-criu.
+#   5. Print install guidance for the `criu` package if it's not on PATH.
+#
+# CRIU itself is NOT installed by this script — see the printed guidance
+# at the end. Terminator works as a normal terminal emulator without it;
+# checkpoint/restore is opt-in.
+
+set -euo pipefail
+
+# ----- Resolution ----------------------------------------------------------
+
+# Locate the helper. Prefer the installed location next to this script
+# (so a setup.py install with --prefix=/foo works), then fall back to
+# /usr/local/bin and PATH.
+here=$(cd "$(dirname "$0")" && pwd)
+helper=""
+for candidate in \
+    "$here/terminator-criu-helper" \
+    "/usr/local/bin/terminator-criu-helper" \
+    "/usr/bin/terminator-criu-helper" \
+    "$(command -v terminator-criu-helper 2>/dev/null || true)"
+do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        helper="$candidate"
+        break
+    fi
+done
+
+# Locate the sudoers template — installed to <prefix>/share/terminator/criu/
+# in the clean case. Modern setuptools' `setup.py install` packs
+# `data_files` inside the egg instead, so we also glob the dist-packages
+# for terminator-*.egg/share/terminator/criu/ as a fallback.
+sudoers_template=""
+egg_candidates=()
+for python_libdir in \
+    /usr/local/lib/python*/dist-packages \
+    /usr/lib/python*/dist-packages \
+    /usr/local/lib/python*/site-packages \
+    /usr/lib/python*/site-packages
+do
+    [[ -d "$python_libdir" ]] || continue
+    for egg in "$python_libdir"/terminator-*.egg; do
+        [[ -d "$egg" ]] || continue
+        egg_candidates+=( "$egg/share/terminator/criu/terminator-criu.sudoers" )
+    done
+done
+for candidate in \
+    "$here/../share/terminator/criu/terminator-criu.sudoers" \
+    "/usr/local/share/terminator/criu/terminator-criu.sudoers" \
+    "/usr/share/terminator/criu/terminator-criu.sudoers" \
+    "${egg_candidates[@]}"
+do
+    if [[ -f "$candidate" ]]; then
+        sudoers_template=$(cd "$(dirname "$candidate")" && pwd)/$(basename "$candidate")
+        break
+    fi
+done
+
+# ----- Pre-flight ---------------------------------------------------------
+
+if [[ $EUID -ne 0 ]]; then
+    echo "terminator-criu-setup must be run as root (try: sudo $0)" >&2
+    exit 1
+fi
+if [[ -z "$helper" ]]; then
+    cat >&2 <<EOF
+Could not locate terminator-criu-helper. Looked in:
+  $here/terminator-criu-helper
+  /usr/local/bin/terminator-criu-helper
+  /usr/bin/terminator-criu-helper
+  (PATH)
+
+Did 'python3 setup.py install' complete? (You may need to install
+terminator first via your distro package or 'sudo python3 setup.py install'.)
+EOF
+    exit 1
+fi
+if [[ -z "$sudoers_template" ]]; then
+    cat >&2 <<EOF
+Could not locate the sudoers template. Looked in:
+  $here/../share/terminator/criu/terminator-criu.sudoers
+  /usr/local/share/terminator/criu/terminator-criu.sudoers
+  /usr/share/terminator/criu/terminator-criu.sudoers
+
+This usually means terminator's data files weren't installed. Re-run
+'python3 setup.py install' or install via your distro package.
+EOF
+    exit 1
+fi
+
+echo "Helper:           $helper"
+echo "Sudoers template: $sudoers_template"
+echo
+
+# ----- 1. Group ------------------------------------------------------------
+
+if ! getent group terminator-criu >/dev/null; then
+    groupadd --system terminator-criu
+    echo "Created group: terminator-criu"
+else
+    echo "Group terminator-criu already exists"
+fi
+
+# ----- 2. User membership --------------------------------------------------
+
+target_user="${INSTALL_FOR_USER:-${SUDO_USER:-}}"
+if [[ -z "$target_user" ]]; then
+    echo "WARN: could not determine target user (SUDO_USER unset). Skipping membership." >&2
+    echo "      Add users manually: sudo gpasswd -a <user> terminator-criu" >&2
+elif ! id "$target_user" >/dev/null 2>&1; then
+    echo "WARN: user '$target_user' does not exist; skipping" >&2
+elif id -nG "$target_user" | tr ' ' '\n' | grep -qx terminator-criu; then
+    echo "User $target_user is already in terminator-criu"
+else
+    gpasswd -a "$target_user" terminator-criu >/dev/null
+    echo "Added $target_user to terminator-criu."
+    echo "  -> Log out and back in (or run 'newgrp terminator-criu') for it to apply."
+fi
+
+# ----- 3. Sudoers ----------------------------------------------------------
+
+# Render the template with the actual detected helper path so the rule
+# matches wherever terminator was installed. The template uses a stable
+# /usr/local/bin/... path by default; if we found something different,
+# patch the rendered copy.
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+sed "s|/usr/local/bin/terminator-criu-helper|$helper|g" "$sudoers_template" > "$tmp"
+
+if ! visudo -cf "$tmp" >/dev/null; then
+    echo "Sudoers template failed visudo check; refusing to install" >&2
+    echo "(rendered file kept at $tmp for inspection)"
+    trap - EXIT
+    exit 1
+fi
+install -o root -g root -m 0440 "$tmp" /etc/sudoers.d/terminator-criu
+echo "Installed sudoers rule at /etc/sudoers.d/terminator-criu"
+
+# ----- 4. CRIU presence (advisory) -----------------------------------------
+
+echo
+if command -v criu >/dev/null; then
+    criu_version=$(criu --version 2>/dev/null | head -n1 || true)
+    echo "CRIU detected: $criu_version"
+    echo "  -> You can verify end-to-end with: sudo terminator-criu-helper check"
+else
+    cat <<'EOF'
+NOTE: 'criu' is not on PATH yet. Terminator works as a normal terminal
+emulator without it; install CRIU only if you want to enable
+checkpoint/restore of per-tab processes.
+
+Install instructions by distro:
+
+  Ubuntu/Debian (PPA for noble / 24.04):
+    sudo add-apt-repository ppa:criu/ppa
+    sudo apt-get update
+    sudo apt-get install criu python3-pycriu
+
+  Fedora / RHEL:
+    sudo dnf install criu python3-criu
+
+  Arch:
+    sudo pacman -S criu python-pycriu
+
+  Build from source:
+    https://criu.org/Installation
+
+After installing, verify with:
+    sudo terminator-criu-helper check
+EOF
+fi
+
+echo
+echo "Setup complete."

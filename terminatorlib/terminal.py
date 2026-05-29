@@ -4,6 +4,7 @@
 
 
 import os
+import pty as _pty_alloc  # only used by the CRIU spawn path
 import signal
 import time
 import gi
@@ -11,6 +12,25 @@ from gi.repository import GLib, GObject, Pango, Gtk, Gdk, GdkPixbuf, cairo
 gi.require_version('Vte', '2.91')  # vte-0.38 (gnome-3.14)
 from gi.repository import Vte
 import subprocess
+
+# Optional CRIU integration. The terminatorlib.criu package is only
+# installed when setup.py detected `criu` + `pycriu` at install time;
+# tolerate the ImportError so terminal.py still works on systems
+# without it. The popup menu handles the "package missing" tooltip.
+try:
+    from .criu.client import CriuClient as _CriuClient
+    from .criu.client import CriuSpawnError as _CriuSpawnError
+    from .criu.client import CriuOperationError as _CriuOperationError
+    from .criu.client import Status as _CriuStatus
+    from .criu.client import checkpoint_dir_for_uuid as _criu_ckpt_dir_for_uuid
+    _criu_client = _CriuClient()
+except ImportError:
+    _CriuClient = None
+    _CriuSpawnError = None
+    _CriuOperationError = None
+    _CriuStatus = None
+    _criu_ckpt_dir_for_uuid = None
+    _criu_client = None
 try:
     from urllib.parse import unquote as urlunquote
 except ImportError:
@@ -110,6 +130,43 @@ class Terminal(Gtk.VBox):
 
     is_held_open = False
 
+    # CRIU checkpoint/restore opt-in for this specific terminal.
+    # Initialized from the profile's `checkpoint_enabled` setting at
+    # spawn time; can be toggled per-tab via the right-click menu so
+    # the user can opt a single tab in or out without changing the
+    # profile-wide default. None until __init__ resolves it.
+    checkpoint_enabled = None
+
+    # When the CRIU path is taken, this holds the subprocess.Popen
+    # handle for the sudo+helper-parent chain so we can reap it when
+    # the terminal closes. None for normal (non-CRIU) tabs.
+    _criu_helper_proc = None
+
+    # Set to True by callers (e.g. a future "checkpoint all and quit"
+    # action) when this tab's checkpoint dir should survive the tab's
+    # death — so the next terminator launch can restore from it.
+    # Defaults False: a tab that exits on its own (user typed exit, or
+    # explicit close) wipes its checkpoint dir, because the user is
+    # done with that workspace.
+    _criu_preserve_checkpoint_on_exit = False
+
+    # Set by create_layout when the loaded layout entry requested a
+    # CRIU restore for this terminal. spawn_child checks this and
+    # routes through _restore_via_criu_helper instead of a normal or
+    # CRIU-spawn path.
+    _criu_restore_requested = False
+
+    # True iff this terminal is currently backed by either a CRIU spawn
+    # OR a CRIU restore — used by the child-exited cleanup to decide
+    # whether to delete the checkpoint dir.
+    _criu_active = False
+
+    # GTK handler id for our always-on `child-exited` cleanup handler.
+    # Tracked here (not in Signalman) so we can disconnect on
+    # reconfigure without colliding with the exit_action handler that
+    # Signalman manages for the same signal.
+    _criu_cleanup_handler_id = None
+
     fgcolor_active = None
     fgcolor_inactive = None
     bgcolor = None
@@ -139,6 +196,10 @@ class Terminal(Gtk.VBox):
         self.cnxids = Signalman()
 
         self.config = Config()
+
+        # Per-tab CRIU opt-in starts from the profile default; the popup
+        # menu lets the user override it after the fact.
+        self.checkpoint_enabled = bool(self.config['checkpoint_enabled'])
 
         self.cwd = get_pid_cwd()
         self.origcwd = self.terminator.origcwd
@@ -720,6 +781,20 @@ class Terminal(Gtk.VBox):
         elif self.config['exit_action'] in ('close', 'left'):
             self.cnxids.new(self.vte, 'child-exited',
                                             lambda x, y: self.emit('close-term'))
+
+        # Always-on cleanup for CRIU-spawned tabs. Fires alongside the
+        # exit_action handler above. Connected DIRECTLY via Vte (not
+        # through Signalman) because Signalman only tracks one handler
+        # per signal per widget — the exit_action handler already
+        # claims that slot. We manage the handler id ourselves so
+        # repeated reconfigure() calls don't accumulate duplicates.
+        if getattr(self, '_criu_cleanup_handler_id', None) is not None:
+            try:
+                self.vte.disconnect(self._criu_cleanup_handler_id)
+            except Exception:
+                pass
+        self._criu_cleanup_handler_id = self.vte.connect(
+            'child-exited', self._criu_cleanup_on_child_exited)
 
         # Word char support was missing from vte 0.38, silently skip this setting
         if hasattr(self.vte, 'set_word_char_exceptions'):
@@ -1619,6 +1694,405 @@ class Terminal(Gtk.VBox):
         self.is_held_open = True
         self.titlebar.update()
 
+    _SCROLLBACK_FILENAME = 'scrollback.vte'
+
+    def _save_scrollback(self, ckpt_dir):
+        """Capture VTE's current screen+scrollback into a file alongside
+        the CRIU dump. The file uses VTE's own contents-stream format
+        which `vte.feed()` can re-parse to reproduce the visual state
+        on restore.
+
+        ckpt_dir must already exist on disk. Failures are logged and
+        silently swallowed — losing scrollback shouldn't block a CRIU
+        dump from succeeding.
+        """
+        if not ckpt_dir or not os.path.isdir(ckpt_dir):
+            return
+        try:
+            from gi.repository import Gio
+            path = os.path.join(ckpt_dir, self._SCROLLBACK_FILENAME)
+            gfile = Gio.File.new_for_path(path)
+            stream = gfile.replace(None, False, Gio.FileCreateFlags.NONE,
+                                   None)
+            self.vte.write_contents_sync(stream,
+                                         Vte.WriteFlags.DEFAULT, None)
+            stream.close(None)
+            dbg('CRIU: saved scrollback to %s' % path)
+        except Exception as e:
+            err('CRIU: failed to save scrollback to %s: %s'
+                % (ckpt_dir, e))
+
+    def _restore_scrollback(self, ckpt_dir):
+        """Replay the saved screen+scrollback into VTE's buffer.
+
+        Call AFTER set_pty (so VTE has a fresh buffer to populate) but
+        BEFORE the restored process starts producing output (otherwise
+        new output and replayed history will be interleaved oddly).
+
+        No-op if the scrollback file is missing or unreadable — we
+        always want CRIU restore itself to proceed."""
+        if not ckpt_dir:
+            return
+        path = os.path.join(ckpt_dir, self._SCROLLBACK_FILENAME)
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+            if data:
+                # vte.write_contents_sync produces line terminators as
+                # LF only (no CR). VTE's parser treats LF as "down one
+                # row, same column" — feeding raw saves leaves the
+                # cursor wherever the previous line ended and every
+                # subsequent line starts there, creating a diagonal
+                # staircase of indents. Normalize to CRLF so each line
+                # starts at column 0.
+                data = data.replace(b'\n', b'\r\n')
+                self.vte.feed(data)
+                dbg('CRIU: restored %d bytes of scrollback from %s'
+                    % (len(data), path))
+        except Exception as e:
+            err('CRIU: failed to restore scrollback from %s: %s'
+                % (path, e))
+
+    def _criu_auto_checkpoint(self):
+        """Take a fresh CRIU snapshot of this tab for an automatic
+        trigger (window close, OS shutdown, sleep, idle kick).
+
+        Replaces any existing checkpoint dir for this tab — auto-
+        triggers always overwrite, never merge. Callers that need the
+        dir preserved past tab death must set
+        `_criu_preserve_checkpoint_on_exit = True` before invoking
+        this (the dump can race with terminal teardown).
+
+        Returns True on success, False if no CRIU action was taken
+        (tab not in a namespace, helper unavailable, dump failed).
+        """
+        if not self._criu_active:
+            return False
+        if _criu_client is None or _criu_ckpt_dir_for_uuid is None:
+            return False
+        if not _criu_client.is_available():
+            return False
+        ckpt_dir = _criu_ckpt_dir_for_uuid(self.uuid.hex)
+        # CRIU dumps additive into the target dir — a re-dump on top of
+        # an older dump leaves a mix of files from both. Wipe first so
+        # the dir always reflects the latest snapshot.
+        if os.path.isdir(ckpt_dir):
+            try:
+                import shutil as _sh
+                _sh.rmtree(ckpt_dir, ignore_errors=True)
+            except Exception as e:
+                err('Could not clear stale checkpoint dir before '
+                    're-dump (%s): %s' % (ckpt_dir, e))
+        # Need the dir to exist before saving scrollback into it (CRIU
+        # would create it itself, but our scrollback file goes first).
+        try:
+            os.makedirs(ckpt_dir, exist_ok=True)
+        except OSError:
+            pass
+        # Capture VTE buffer BEFORE the CRIU dump so the saved view is
+        # as close to the dumped process state as possible.
+        self._save_scrollback(ckpt_dir)
+        try:
+            _criu_client.dump(self.pid, ckpt_dir, leave_running=True)
+            dbg('CRIU auto-checkpoint: dumped tab %s to %s'
+                % (self.uuid, ckpt_dir))
+            return True
+        except Exception as e:
+            err('CRIU auto-checkpoint failed for tab %s: %s'
+                % (self.uuid, e))
+            return False
+
+    def _criu_cleanup_on_child_exited(self, _vte, _status):
+        """Reap the helper subprocess and wipe this tab's checkpoint
+        directory when bash dies. Only fires real work for tabs that
+        were spawned-via OR restored-via the CRIU helper.
+
+        The checkpoint dir is preserved when
+        `_criu_preserve_checkpoint_on_exit` is True — that flag is set
+        by future "Checkpoint all tabs and quit" workflows so the next
+        terminator launch can restore from these dumps.
+        """
+        if not self._criu_active:
+            return  # not a CRIU tab; nothing to do
+
+        # 1. Reap the helper subprocess. By the time child-exited fires,
+        # bash inside the namespace is gone, the helper-parent's wait()
+        # has returned, and the sudo chain has exited — so wait() here
+        # is non-blocking in practice. Still bound the wait.
+        try:
+            self._criu_helper_proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            dbg('CRIU helper did not exit on time; terminating')
+            try:
+                self._criu_helper_proc.terminate()
+                self._criu_helper_proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        except Exception as e:
+            dbg('CRIU helper reap failed: %s' % e)
+        self._criu_helper_proc = None
+
+        # 2. Delete the tab's checkpoint dir, unless explicitly told to
+        # keep it for cross-restart restore.
+        if self._criu_preserve_checkpoint_on_exit:
+            dbg('CRIU: preserving checkpoint dir for tab %s' % self.uuid)
+            return
+        if _criu_ckpt_dir_for_uuid is None:
+            return  # CRIU package wasn't installed; nothing to delete
+        ckpt_dir = _criu_ckpt_dir_for_uuid(self.uuid.hex)
+        if os.path.isdir(ckpt_dir):
+            try:
+                import shutil as _sh
+                _sh.rmtree(ckpt_dir, ignore_errors=True)
+                dbg('CRIU: deleted stale checkpoint dir %s' % ckpt_dir)
+            except Exception as e:
+                err('CRIU: failed to delete %s: %s' % (ckpt_dir, e))
+
+    def _feed_error(self, message):
+        """Write a human-readable error into the VTE widget so the user
+        can see why their checkpoint-enabled tab fell back to a normal
+        spawn (or failed). Newlines are CRLF since VTE expects raw
+        terminal input."""
+        text = (message + '\r\n').encode('utf-8')
+        try:
+            self.vte.feed(text)
+        except Exception:
+            # If feeding fails for any reason, swallow — there's no
+            # better channel for visibility here.
+            err('VTE feed failed: %s' % message)
+
+    def _spawn_via_criu_helper(self, args, envv):
+        """Spawn this tab via the terminator-criu-helper inside a fresh
+        PID + mount namespace, attached to a PTY we allocated ourselves.
+
+        `args` is the full argv (shell + args), matching what would be
+        passed to Vte.Terminal.spawn_sync(). `envv` is a list of
+        "KEY=VALUE" strings, same as VTE expects.
+
+        Returns True on full success (VTE wired up, helper running,
+        self.pid set). Returns False on any failure, after feeding a
+        visible error message into the VTE widget. On a False return
+        the caller continues to the normal VTE spawn path so the tab
+        still opens — just without checkpoint capability.
+        """
+        # Step 1: gate on availability. Most "loud fallback" cases
+        # bottom out here without ever touching the PTY.
+        if _criu_client is None:
+            self._feed_error(_(
+                'CRIU checkpoint requested but terminator was installed '
+                'without CRIU support. Falling back to a normal tab. '
+                'See CRIU.md.'
+            ))
+            return False
+        status = _criu_client.status(force_recheck=True)
+        if status != _CriuStatus.READY:
+            self._feed_error(
+                'Checkpoint/restore requested but unavailable: %s '
+                'Falling back to a normal tab.'
+                % _criu_client.status_message()
+            )
+            return False
+
+        # Step 2: allocate a PTY pair we control. Master goes to VTE
+        # for display; slave path goes to the helper, which opens it
+        # inside the new namespace as the controlling tty.
+        try:
+            master_fd, slave_fd = _pty_alloc.openpty()
+            slave_path = os.ttyname(slave_fd)
+        except OSError as e:
+            self._feed_error(
+                'Failed to allocate PTY for CRIU spawn (%s). '
+                'Falling back to a normal tab.' % e
+            )
+            return False
+
+        try:
+            vte_pty = Vte.Pty.new_foreign_sync(master_fd, None)
+        except GLib.Error as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            self._feed_error(
+                'Vte.Pty.new_foreign_sync failed (%s). Falling back.' % e
+            )
+            return False
+
+        # Hand the master to VTE. From here on, if we abort, we MUST
+        # reset VTE's pty so the fallback spawn allocates a fresh one.
+        self.vte.set_pty(vte_pty)
+        # We don't need the slave fd locally — the helper will open the
+        # path itself. The PTY pair stays alive because VTE has master.
+        os.close(slave_fd)
+
+        # Step 3: convert envv list to dict for the helper's env-file.
+        env = {}
+        for kv in envv or ():
+            if '=' in kv:
+                k, v = kv.split('=', 1)
+                env[k] = v
+
+        # Step 4: invoke the helper. `args` at this point has the shape
+        # `[shell, shell, ...]` because the surrounding terminator code
+        # prepends the shell path for VTE's FILE_AND_ARGV_ZERO spawn
+        # convention. Our helper uses a plain execvpe, so we want the
+        # argv list as the spawned program will actually see it —
+        # `args[1:]` (which starts with shell as argv[0], same as a
+        # normal exec).
+        program_argv = list(args[1:])
+        try:
+            result = _criu_client.spawn(slave_path, program_argv, env=env)
+        except _CriuSpawnError as e:
+            # The helper failed before we got a PID. VTE has the
+            # foreign pty attached but with no process on the slave —
+            # detach so the fallback spawn can allocate its own.
+            try:
+                self.vte.set_pty(None)
+            except Exception:
+                pass
+            os.close(master_fd)
+            self._feed_error(
+                'CRIU helper failed: %s\r\nFalling back to a normal tab.'
+                % e
+            )
+            return False
+
+        # Step 5: success — store state. master_fd is now owned by VTE
+        # (via the Vte.Pty wrapper) so we don't close it ourselves.
+        self.pid = result.host_pid
+        self._criu_helper_proc = result.helper_proc
+        self._criu_active = True
+
+        # Tell VTE which PID it's hosting so it fires `child-exited`
+        # when bash inside the namespace dies. Without this, typing
+        # `exit` looks like a hang — the slave PTY closes, the master
+        # gets EOF, but VTE has no PID to waitpid() on so the tab
+        # doesn't auto-close. watch_child() uses pidfd under the hood
+        # and works fine across PID-namespace boundaries since pidfds
+        # are by-process-handle, not by-parent.
+        try:
+            self.vte.watch_child(result.host_pid)
+        except Exception as e:
+            # Older VTE without watch_child — fall back to whatever
+            # default behavior. The user will see the tab not close
+            # on exit; not fatal, just suboptimal.
+            err('Vte.Terminal.watch_child failed: %s' % e)
+
+        dbg('CRIU helper spawned host-pid=%d (PID 1 inside namespace)'
+            % result.host_pid)
+        return True
+
+    def _restore_via_criu_helper(self):
+        """Restore this tab's processes from `$XDG_DATA_HOME/...
+        /terminator-criu/checkpoints/<uuid>/` via the helper. Mirrors
+        _spawn_via_criu_helper in shape: allocate PTY, set as foreign
+        on VTE, hand slave to helper, watch_child the resulting PID.
+
+        Returns True on full success. False on any failure, after
+        feeding a visible error into VTE — caller falls back to normal
+        spawn so the tab still opens.
+        """
+        if _criu_client is None or _criu_ckpt_dir_for_uuid is None:
+            self._feed_error(_(
+                'CRIU restore requested but terminator was installed '
+                'without CRIU support. Spawning a fresh tab instead. '
+                'See CRIU.md.'
+            ))
+            return False
+        ckpt_dir = _criu_ckpt_dir_for_uuid(self.uuid.hex)
+        if not os.path.isdir(ckpt_dir):
+            self._feed_error(
+                'CRIU restore requested but checkpoint dir is gone: %s\r\n'
+                'Spawning a fresh tab instead.' % ckpt_dir
+            )
+            return False
+        status = _criu_client.status(force_recheck=True)
+        if status != _CriuStatus.READY:
+            self._feed_error(
+                'Checkpoint/restore unavailable: %s '
+                'Spawning a fresh tab instead.'
+                % _criu_client.status_message()
+            )
+            return False
+
+        try:
+            master_fd, slave_fd = _pty_alloc.openpty()
+            slave_path = os.ttyname(slave_fd)
+        except OSError as e:
+            self._feed_error(
+                'Failed to allocate PTY for CRIU restore (%s). '
+                'Spawning a fresh tab instead.' % e
+            )
+            return False
+
+        try:
+            vte_pty = Vte.Pty.new_foreign_sync(master_fd, None)
+        except GLib.Error as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            self._feed_error(
+                'Vte.Pty.new_foreign_sync failed (%s). Spawning a '
+                'fresh tab instead.' % e
+            )
+            return False
+
+        self.vte.set_pty(vte_pty)
+        os.close(slave_fd)
+
+        # Replay scrollback BEFORE the restored process starts producing
+        # fresh output. VTE parses the saved stream and populates its
+        # screen + scrollback buffer with the historical view; once
+        # criu_client.restore() returns the process resumes and writes
+        # appear after the replayed history. If no scrollback file is
+        # present (older dump, save failed) this is a no-op.
+        #
+        # The per-profile `checkpoint_restore_scrollback` flag lets the
+        # user opt out of replay (e.g. they prefer a clean screen even
+        # for restored tabs). Save always runs at dump time, so the
+        # file is on disk regardless — only the replay is gated.
+        if self.config['checkpoint_restore_scrollback']:
+            self._restore_scrollback(ckpt_dir)
+
+        try:
+            result = _criu_client.restore(ckpt_dir, slave_path)
+        except _CriuOperationError as e:
+            try:
+                self.vte.set_pty(None)
+            except Exception:
+                pass
+            os.close(master_fd)
+            self._feed_error(
+                'CRIU restore failed: %s\r\nSpawning a fresh tab instead.'
+                % e
+            )
+            return False
+
+        self.pid = result.host_pid
+        self._criu_helper_proc = result.helper_proc  # None — restore detaches
+        self._criu_active = True
+        try:
+            self.vte.watch_child(result.host_pid)
+        except Exception as e:
+            err('Vte.Terminal.watch_child failed: %s' % e)
+
+        # Consume-on-restore: the checkpoint dir we just loaded into a
+        # running process is now stale (the process has diverged from
+        # the saved state the moment it resumes). Delete it so the user
+        # has a clear mental model — a checkpoint exists iff a fresh
+        # one has been taken. If they want a new restore-point, they
+        # explicitly checkpoint the live tab again.
+        try:
+            import shutil as _sh
+            _sh.rmtree(ckpt_dir, ignore_errors=True)
+            dbg('CRIU: consumed checkpoint dir %s after restore' % ckpt_dir)
+        except Exception as e:
+            err('CRIU: failed to consume %s after restore: %s'
+                % (ckpt_dir, e))
+
+        dbg('CRIU helper restored host-pid=%d (from %s)'
+            % (result.host_pid, ckpt_dir))
+        return True
+
     def spawn_child(self, widget=None, respawn=False, debugserver=False, init_command=None):
         args = []
         shell = None
@@ -1697,6 +2171,31 @@ class Terminal(Gtk.VBox):
 
         dbg('Forking shell: "%s" with args: %s' % (shell, args))
         args.insert(0, shell)
+
+        # CRIU restore path: a previous session saved a layout that
+        # asked for this terminal to be restored from a checkpoint dir.
+        # On any failure we feed an error and fall through to normal
+        # spawn so the tab still opens.
+        if self._criu_restore_requested:
+            self._criu_restore_requested = False  # one-shot
+            if self._restore_via_criu_helper():
+                self.command = shell
+                self.titlebar.update()
+                return
+            # Loud-fallback path: error already fed; continue to normal.
+
+        # CRIU checkpoint-capable spawn path.
+        # If this tab is opted in (profile default or per-tab toggle)
+        # AND the helper is actually usable, route through it. On any
+        # failure we visibly tell the user (loud fallback) and continue
+        # to the normal VTE spawn so the tab still opens.
+        if self.checkpoint_enabled:
+            if self._spawn_via_criu_helper(args, envv):
+                # Success — VTE is wired up, helper is running.
+                self.command = shell
+                self.titlebar.update()
+                return
+            # Loud-fallback path: error already fed; continue to normal.
 
         if util.is_flatpak():
             dbg('Flatpak detected')
@@ -1925,6 +2424,14 @@ class Terminal(Gtk.VBox):
         layout['uuid'] = self.uuid
         if save_cwd:
             layout['directory'] = self.get_cwd()
+        # If a CRIU checkpoint dir exists on disk for this tab's uuid,
+        # mark the layout entry so the session-load path knows to route
+        # through criu restore instead of a fresh spawn. The dir name
+        # is keyed by uuid (already saved above) so presence flag is
+        # all we need.
+        if (_criu_ckpt_dir_for_uuid is not None
+                and os.path.isdir(_criu_ckpt_dir_for_uuid(self.uuid.hex))):
+            layout['criu_restore'] = True
         name = 'terminal%d' % count
         count = count + 1
         global_layout[name] = layout
@@ -1948,6 +2455,17 @@ class Terminal(Gtk.VBox):
             self.directory = layout['directory']
         if 'uuid' in layout and layout['uuid'] != '':
             self.uuid = make_uuid(layout['uuid'])
+        # If the saved layout requested a CRIU restore, latch the flag
+        # so spawn_child routes through _restore_via_criu_helper. Only
+        # act if the checkpoint dir still exists on disk — otherwise
+        # silently fall through to a fresh spawn.
+        if layout.get('criu_restore') and _criu_ckpt_dir_for_uuid is not None:
+            ckpt_dir = _criu_ckpt_dir_for_uuid(self.uuid.hex)
+            if os.path.isdir(ckpt_dir):
+                self._criu_restore_requested = True
+            else:
+                dbg('CRIU: layout asked for restore but dir is gone: %s'
+                    % ckpt_dir)
 
     def scroll_by_page(self, pages):
         """Scroll up or down in pages"""

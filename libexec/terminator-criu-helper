@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+# Terminator by Chris Jones <cmsj@tenshu.net>
+# GPL v2 only
+"""terminator-criu-helper - root helper for checkpoint/restore of per-tab processes
+
+Invoked via a NOPASSWD sudoers entry. Terminator itself stays unprivileged
+and shells out to this helper for the four operations that need root:
+
+  check
+      Probe CRIU functionality (used at startup to gate UI features).
+
+  spawn --uid N --gid N --slave PATH --pid-file PATH --state-dir PATH -- PROG [ARGS]
+      Create a new PID + mount namespace, drop privileges to (uid, gid),
+      attach the given PTY slave as the controlling tty, and exec the
+      requested program. Reports the spawned host-side PID to --pid-file
+      and then acts as PID 1 of the namespace until the child exits.
+
+  dump --owner-uid N --owner-gid N --pid N --ckpt-dir PATH --state-dir PATH
+      Checkpoint the process tree rooted at --pid via CRIU. CRIU images
+      and logs are written into --ckpt-dir, which is chowned back to
+      (owner-uid, owner-gid) before this helper returns so the unprivileged
+      caller can read them.
+
+  restore --owner-uid N --owner-gid N --ckpt-dir PATH --slave PATH --state-dir PATH
+      Restore a previously-dumped tree from --ckpt-dir, plumbing the
+      newly-allocated --slave PTY in place of the originally-checkpointed
+      one via CRIU's --inherit-fd. Symmetric chown-back at the end.
+
+See CRIU.md at the repo root for the broader design.
+"""
+import argparse
+import ctypes
+import ctypes.util
+import glob
+import json
+import os
+import pwd
+import signal
+import subprocess
+import sys
+import tempfile
+
+import pycriu
+import pycriu.images
+# Note: `pycriu.criu` resolves to the class (re-exported from __init__),
+# not the submodule. Alias to avoid confusion.
+CriuClient = pycriu.criu
+
+CLONE_NEWPID = 0x20000000
+CLONE_NEWNS = 0x00020000
+MS_REC = 0x4000
+MS_SLAVE = 0x80000
+MS_PRIVATE = 0x40000
+
+PR_SET_PDEATHSIG = 1
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_libc.mount.argtypes = [
+    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+    ctypes.c_ulong, ctypes.c_void_p,
+]
+_libc.mount.restype = ctypes.c_int
+_libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+_libc.prctl.restype = ctypes.c_int
+_libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
+_libc.umount2.restype = ctypes.c_int
+
+MNT_DETACH = 2  # lazy unmount
+
+
+def unshare(flags: int) -> None:
+    rc = _libc.unshare(flags)
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), f"unshare({flags:#x})")
+
+
+def make_root_rprivate() -> None:
+    """Detach our mount namespace from the host's mount propagation,
+    AND clear slave (master_id) relationships.
+
+    Without this, mounts we perform inside our new namespace propagate
+    back to the host because systemd defaults / to MS_SHARED. Skipping
+    this step once corrupted the host /proc and required a reboot.
+
+    MS_PRIVATE (vs MS_SLAVE) is stronger — it clears master_id too,
+    which simplifies CRIU's view of inherited host mounts at dump time.
+    """
+    if _libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), "mount(/, MS_REC|MS_PRIVATE)")
+
+
+def set_pdeathsig(sig: int) -> None:
+    if _libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), "prctl(PR_SET_PDEATHSIG)")
+
+
+# Mountpoint prefixes whose entire subtree we prune from the inherited
+# host mount namespace. Everything else (/, /home, /usr, /tmp, /var, /etc,
+# /opt, /mnt, /media) is left intact so bash sees a normal filesystem.
+_PRUNE_PREFIXES = (
+    "/sys",
+    "/run",
+    "/snap",
+    "/boot",
+    "/dev/hugepages",
+    "/dev/mqueue",
+    "/dev/shm",
+    "/proc",
+)
+
+
+def _enumerate_mounts() -> list[str]:
+    """Read /proc/self/mountinfo and return mountpoints, deepest first.
+
+    Must be called BEFORE we start unmounting (since unmounting /proc
+    later would invalidate this view)."""
+    mounts: list[str] = []
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            mounts.append(parts[4])
+    mounts.sort(key=lambda p: (p.count("/"), len(p)), reverse=True)
+    return mounts
+
+
+def _prune_inherited_mounts() -> None:
+    """Lazy-unmount every mount under our prune prefixes.
+
+    Uses umount2(MNT_DETACH) directly via libc rather than forking the
+    umount(8) binary — both for speed and to avoid subprocess-related
+    flakiness when we've already started disturbing the mount tree."""
+    all_mounts = _enumerate_mounts()
+    for mp in all_mounts:
+        if mp == "/":
+            continue
+        if not any(mp == p or mp.startswith(p + "/") for p in _PRUNE_PREFIXES):
+            continue
+        rc = _libc.umount2(mp.encode(), MNT_DETACH)
+        err = ctypes.get_errno() if rc != 0 else 0
+        print(f"  umount2 {mp} rc={rc} errno={err}",
+              file=sys.stderr, flush=True)
+
+
+def _load_env_file(path: str) -> dict:
+    """Parse a KEY=VALUE-per-line env file. Lines without `=` or
+    starting with `#` are skipped. Values may NOT contain newlines
+    (use a different mechanism if you need that)."""
+    env = {}
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
+
+
+def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
+              state_dir: str, env_file: str, program_argv: list[str]) -> None:
+    # Diagnostic log goes inside the caller-provided state dir (typically
+    # $XDG_RUNTIME_DIR/terminator-criu/) so we don't pollute /tmp and the
+    # caller can find it predictably.
+    log_path = os.path.join(state_dir, "helper.log")
+    log_fd = os.open(log_path,
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(log_fd, 2)
+    os.close(log_fd)
+    # Make the log readable by the state-dir owner — easiest: chown to
+    # the dir's owner since they were the ones to create it.
+    try:
+        st = os.stat(state_dir)
+        os.chown(log_path, st.st_uid, st.st_gid, follow_symlinks=False)
+    except OSError:
+        pass
+    print(f"\n=== spawn pid={os.getpid()} ===", file=sys.stderr, flush=True)
+
+    # If our parent (sudo / the driver) dies, take the whole chain down
+    # rather than leaving an orphan in a namespace.
+    set_pdeathsig(signal.SIGKILL)
+
+    # Load the caller-supplied env BEFORE we unshare/fork so both halves
+    # of the helper inherit the parsed dict. Empty if no --env-file was
+    # passed (we fall back to a hardcoded minimum below).
+    caller_env = _load_env_file(env_file) if env_file else {}
+
+    unshare(CLONE_NEWPID | CLONE_NEWNS)
+
+    # CRITICAL: detach from the host's mount propagation BEFORE any mount,
+    # or our /proc mount escapes to the host. See feedback memory.
+    make_root_rprivate()
+
+    # After unshare(CLONE_NEWPID), the first fork()'d child becomes PID 1
+    # of the new namespace.
+    pid = os.fork()
+    if pid != 0:
+        # Parent: still in host ns. Report child host-PID via temp file
+        # (atomically — write to .tmp then rename), then act as init by
+        # waiting for the child.
+        tmp_path = report_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            f.write(f"{pid}\n")
+        os.rename(tmp_path, report_path)
+        try:
+            while True:
+                done_pid, _status = os.wait()
+                if done_pid == pid:
+                    break
+        except ChildProcessError:
+            pass
+        sys.exit(0)
+
+    # Child: PID 1 of new namespace. Same pdeathsig dance — if the
+    # helper-parent dies, this child (and via PID-ns init semantics,
+    # everything in the namespace) should also die.
+    set_pdeathsig(signal.SIGKILL)
+    print(f"=== child pid={os.getpid()} starting ===", file=sys.stderr, flush=True)
+
+    # Prune host-inherited mounts. CRIU restore tries to unmount these
+    # one-by-one and fails (e.g. on /sys "Device or resource busy"). Far
+    # easier to give CRIU a minimal namespace to dump in the first place.
+    # Lazy + recursive so nested mounts go too without ordering pain.
+    _prune_inherited_mounts()
+    print("pruned mounts ok", file=sys.stderr, flush=True)
+
+    # Mount a private /proc so tools inside see only this namespace.
+    # Safe to do now that root is MS_PRIVATE — won't propagate to host.
+    subprocess.run(
+        ["mount", "-t", "proc", "-o", "nosuid,noexec,nodev", "proc", "/proc"],
+        check=True,
+    )
+    print("mounted /proc ok", file=sys.stderr, flush=True)
+
+    # Open the slave PTY and attach to it as stdin/stdout/stderr +
+    # controlling terminal.
+    print(f"opening slave {slave_path}", file=sys.stderr, flush=True)
+    slave = os.open(slave_path, os.O_RDWR)
+    os.setsid()
+    # TIOCSCTTY = 0x540E — make slave our controlling tty.
+    import fcntl
+    fcntl.ioctl(slave, 0x540E, 0)
+    print("about to dup slave over 0/1/2", file=sys.stderr, flush=True)
+    os.dup2(slave, 0)
+    os.dup2(slave, 1)
+    os.dup2(slave, 2)
+    if slave > 2:
+        os.close(slave)
+
+    # Drop privileges. Order matters: gid before uid.
+    pw = pwd.getpwuid(uid)
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+    # Default to interactive bash if no program was specified.
+    if not program_argv:
+        program_argv = ["/bin/bash", "--norc", "-i"]
+
+    # Start from caller-supplied env (so TERM, COLORTERM, PWD,
+    # TERMINATOR_UUID, etc. all flow through to the spawned program),
+    # then backfill identity defaults so we never exec into something
+    # without HOME / USER / SHELL set.
+    env = dict(caller_env)
+    env.setdefault("HOME", pw.pw_dir)
+    env.setdefault("USER", pw.pw_name)
+    env.setdefault("LOGNAME", pw.pw_name)
+    env.setdefault("SHELL", "/bin/bash")
+    env.setdefault(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    )
+    env.setdefault("TERM", os.environ.get("TERM", "xterm-256color"))
+    os.chdir(pw.pw_dir)
+    os.execvpe(program_argv[0], list(program_argv), env)
+
+
+_TTY_META_FILENAME = "tty_meta.json"
+
+
+def _chown_recursive(path: str, uid: int, gid: int) -> None:
+    """Hand a tree back to the user who invoked us so they can read logs
+    and clean up artifacts without sudo. Skips symlinks so we never
+    accidentally rewrite ownership outside the tree."""
+    for root, dirs, files in os.walk(path):
+        try:
+            os.chown(root, uid, gid, follow_symlinks=False)
+        except OSError:
+            pass
+        for name in dirs + files:
+            try:
+                os.chown(os.path.join(root, name), uid, gid,
+                         follow_symlinks=False)
+            except OSError:
+                pass
+
+
+def _write_criu_extra_config(state_dir: str) -> str:
+    """Drop a fresh CRIU config file inside the caller-owned state dir.
+
+    Contains options the protobuf doesn't expose (currently allow-uprobes).
+    File is recreated each call so updates ship without manual cleanup.
+
+    NOTE: state_dir MUST be in a path that survives our mount-namespace
+    pruning (i.e. NOT under /run). $XDG_STATE_HOME (under /home) is the
+    right choice; /tmp also works."""
+    fd, path = tempfile.mkstemp(prefix="criu-extra-", suffix=".conf",
+                                dir=state_dir)
+    with os.fdopen(fd, "w") as f:
+        f.write("allow-uprobes\n")
+    os.chmod(path, 0o644)
+    return path
+
+
+def _emit_log_tail(ckpt_dir: str, log_name: str, n: int = 40) -> None:
+    """Append last n lines of a CRIU log file to our stderr.
+
+    Run as root by the helper so we have read access regardless of mode;
+    callers (the driver) see it via inherited or captured stderr."""
+    path = os.path.join(ckpt_dir, log_name)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            tail = "".join(f.readlines()[-n:])
+    except OSError as e:
+        sys.stderr.write(f"(could not read {path}: {e})\n")
+        return
+    sys.stderr.write(f"--- {log_name} tail ---\n")
+    sys.stderr.write(tail)
+    if not tail.endswith("\n"):
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+def _write_tty_meta(ckpt_dir: str) -> None:
+    """At dump time, extract the TTY identity into a small metadata file
+    so restore doesn't need to parse CRIU's image schema on the hot path.
+
+    Decouples restore from CRIU image-format changes."""
+    import json
+    rdev = None
+    devpts_dev = None
+    info_path = os.path.join(ckpt_dir, "tty-info.img")
+    if os.path.exists(info_path):
+        with open(info_path, "rb") as f:
+            info = pycriu.images.load(f)
+        if info["entries"]:
+            rdev = info["entries"][0]["rdev"]
+    for mp_path in glob.glob(os.path.join(ckpt_dir, "mountpoints-*.img")):
+        with open(mp_path, "rb") as f:
+            mp = pycriu.images.load(f)
+        for entry in mp["entries"]:
+            if entry.get("source") == "/dev/pts" or entry.get("mountpoint") == "/dev/pts":
+                devpts_dev = int(entry["root_dev"])
+                break
+        if devpts_dev is not None:
+            break
+    if rdev is None or devpts_dev is None:
+        # Process had no controlling TTY — skip; restore will notice
+        # the absence of the meta file and fail with a clear message.
+        return
+    meta_path = os.path.join(ckpt_dir, _TTY_META_FILENAME)
+    with open(meta_path, "w") as f:
+        json.dump({"rdev": rdev, "devpts_dev": devpts_dev}, f)
+    os.chmod(meta_path, 0o644)
+
+
+def cmd_check() -> None:
+    """Verify CRIU is functional on this kernel (used by terminator at
+    startup to decide whether to expose checkpoint UI)."""
+    try:
+        c = CriuClient()
+        c.check()
+    except pycriu.CRIUExceptionExternal as e:
+        print(f"criu check failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print("ok")
+    sys.exit(0)
+
+
+def cmd_dump(owner_uid: int, owner_gid: int, pid: int,
+             ckpt_dir: str, state_dir: str,
+             leave_running: bool) -> None:
+    os.makedirs(ckpt_dir, exist_ok=True)
+    cfg_path = _write_criu_extra_config(state_dir)
+    dir_fd = os.open(ckpt_dir, os.O_RDONLY | os.O_DIRECTORY)
+    rc = 0
+    try:
+        c = CriuClient()
+        c.opts.pid = pid
+        c.opts.images_dir_fd = dir_fd
+        c.opts.shell_job = True
+        c.opts.config_file = cfg_path
+        c.opts.external.append("mnt[]:ms")
+        # Leave the dumped process running after the snapshot so the
+        # user's tab keeps working post-checkpoint (the dump becomes
+        # a restore-point, not the end of the tab). Skip this when
+        # we're checkpointing immediately before terminator quits.
+        if leave_running:
+            c.opts.leave_running = True
+        c.opts.log_level = 4
+        c.opts.log_file = "dump.log"
+        c.opts.display_stats = True
+        try:
+            c.dump()
+        except pycriu.CRIUExceptionExternal as e:
+            print(f"criu dump RPC failed: {e}", file=sys.stderr, flush=True)
+            _emit_log_tail(ckpt_dir, "dump.log")
+            rc = 1
+        else:
+            _write_tty_meta(ckpt_dir)
+    finally:
+        os.close(dir_fd)
+        # Hand artifacts back to the caller so they can read logs / clean
+        # up without sudo. Done in finally so even partial dumps leave
+        # readable debugging material.
+        _chown_recursive(ckpt_dir, owner_uid, owner_gid)
+        try:
+            os.unlink(cfg_path)
+        except OSError:
+            pass
+    sys.exit(rc)
+
+
+def _read_dumped_tty_token(ckpt_dir: str) -> tuple[int, int]:
+    """Read the (rdev, dev) we recorded at dump time.
+
+    Reads our own metadata file, NOT CRIU's image schema — keeps restore
+    decoupled from upstream image-format changes."""
+    import json
+    meta_path = os.path.join(ckpt_dir, _TTY_META_FILENAME)
+    if not os.path.exists(meta_path):
+        raise RuntimeError(
+            f"{_TTY_META_FILENAME} not found in {ckpt_dir}; "
+            "the dump may have been made by an older helper."
+        )
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return int(meta["rdev"]), int(meta["devpts_dev"])
+
+
+def cmd_restore(owner_uid: int, owner_gid: int, ckpt_dir: str,
+                slave_path: str, state_dir: str,
+                pid_file: str) -> None:
+    # (rdev, dev) come from the dump on disk — both reboot-stable.
+    dumped_rdev, dumped_devpts_dev = _read_dumped_tty_token(ckpt_dir)
+    tty_token = f"tty[{dumped_rdev:x}:{dumped_devpts_dev:x}]"
+    print(f"will inherit-fd as {tty_token}", file=sys.stderr, flush=True)
+
+    # Open the new slave PTY at a known fd so --inherit-fd can reference it.
+    slave = os.open(slave_path, os.O_RDWR)
+    target_fd = 100
+    if slave != target_fd:
+        os.dup2(slave, target_fd)
+        os.close(slave)
+    os.set_inheritable(target_fd, True)
+
+    # Match the dumped namespace shape BEFORE running criu restore, so
+    # criu inherits a clean mount tree (matching what bash saw at dump
+    # time) and doesn't try to unmount host /sys etc. from its own
+    # restore-target namespace.
+    unshare(CLONE_NEWNS)
+    make_root_rprivate()
+    _prune_inherited_mounts()
+    subprocess.run(
+        ["mount", "-t", "proc", "-o", "nosuid,noexec,nodev", "proc", "/proc"],
+        check=True,
+    )
+
+    # First, peek at the checkpoint to discover the tty rdev/dev that was
+    # recorded, so we can map fd[100] -> tty[that_id]. CRIU's "crit" tool
+    # can decode the images, but a simpler path is to let CRIU tell us
+    # via the show command. For the PoC we'll just try --shell-job alone
+    # first (CRIU auto-detects the controlling tty in shell-job mode) and
+    # only add --inherit-fd if that fails.
+    cfg_path = _write_criu_extra_config(state_dir)
+    dir_fd = os.open(ckpt_dir, os.O_RDONLY | os.O_DIRECTORY)
+    rc = 0
+    try:
+        c = CriuClient()
+        c.opts.images_dir_fd = dir_fd
+        c.opts.shell_job = True
+        c.opts.root = "/"
+        c.opts.config_file = cfg_path
+        c.opts.external.append("mnt[]:ms")
+        c.opts.mntns_compat_mode = True
+        c.opts.log_level = 4
+        c.opts.log_file = "restore.log"
+        c.opts.display_stats = True
+        inh = c.opts.inherit_fd.add()
+        inh.key = tty_token
+        inh.fd = target_fd
+        try:
+            resp = c.restore()
+        except pycriu.CRIUExceptionExternal as e:
+            print(f"criu restore RPC failed: {e}", file=sys.stderr, flush=True)
+            _emit_log_tail(ckpt_dir, "restore.log")
+            rc = 1
+        else:
+            # Hand the restored root PID back to the caller via the
+            # rendezvous file. resp.pid is the host-namespace PID of
+            # the new root (PID 1 inside the restored PID namespace).
+            try:
+                tmp_path = pid_file + ".tmp"
+                with open(tmp_path, "w") as f:
+                    f.write(f"{resp.pid}\n")
+                os.rename(tmp_path, pid_file)
+            except OSError as e:
+                print(f"failed to write pid-file {pid_file}: {e}",
+                      file=sys.stderr, flush=True)
+                rc = 1
+    finally:
+        os.close(dir_fd)
+        _chown_recursive(ckpt_dir, owner_uid, owner_gid)
+        try:
+            os.unlink(cfg_path)
+        except OSError:
+            pass
+    sys.exit(rc)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="terminator-criu-helper")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("check", help="probe CRIU functionality")
+
+    sp = sub.add_parser("spawn", help="spawn program in PID+mount ns on a PTY")
+    sp.add_argument("--uid", type=int, required=True,
+                    help="UID to drop to before exec")
+    sp.add_argument("--gid", type=int, required=True)
+    sp.add_argument("--slave", required=True, help="PTY slave path")
+    sp.add_argument("--pid-file", required=True,
+                    help="path to write the spawned host PID")
+    sp.add_argument("--state-dir", required=True,
+                    help="dir for helper.log and ephemeral state")
+    sp.add_argument("--env-file", default=None,
+                    help="optional KEY=VALUE-per-line file used as the "
+                         "exec environment. Identity vars (HOME/USER/SHELL "
+                         "etc.) are backfilled if missing.")
+    sp.add_argument("argv", nargs="*",
+                    help="program and args to exec (default: bash -i)")
+
+    sp = sub.add_parser("dump", help="criu dump a process tree")
+    sp.add_argument("--owner-uid", type=int, required=True,
+                    help="chown artifacts to this UID before returning")
+    sp.add_argument("--owner-gid", type=int, required=True)
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--ckpt-dir", required=True,
+                    help="destination dir for CRIU images and our metadata")
+    sp.add_argument("--state-dir", required=True,
+                    help="dir for ephemeral state (CRIU extra config)")
+    sp.add_argument("--leave-running", action="store_true",
+                    help="keep the dumped process running after the "
+                         "snapshot (default: CRIU's default, which "
+                         "kills the process post-dump).")
+
+    sp = sub.add_parser("restore", help="criu restore a process tree")
+    sp.add_argument("--owner-uid", type=int, required=True)
+    sp.add_argument("--owner-gid", type=int, required=True)
+    sp.add_argument("--ckpt-dir", required=True)
+    sp.add_argument("--slave", required=True,
+                    help="freshly-allocated PTY slave for restored process")
+    sp.add_argument("--state-dir", required=True)
+    sp.add_argument("--pid-file", required=True,
+                    help="path to write the restored root host-PID. "
+                         "Caller polls this file to know the restored "
+                         "PID for VTE.watch_child().")
+
+    args = p.parse_args()
+
+    if args.cmd == "check":
+        cmd_check()
+    elif args.cmd == "spawn":
+        cmd_spawn(args.uid, args.gid, args.slave, args.pid_file,
+                  args.state_dir, args.env_file, args.argv)
+    elif args.cmd == "dump":
+        cmd_dump(args.owner_uid, args.owner_gid, args.pid,
+                 args.ckpt_dir, args.state_dir, args.leave_running)
+    elif args.cmd == "restore":
+        cmd_restore(args.owner_uid, args.owner_gid, args.ckpt_dir,
+                    args.slave, args.state_dir, args.pid_file)
+
+
+if __name__ == "__main__":
+    main()

@@ -2189,6 +2189,44 @@
                             <property name="top-attach">3</property>
                           </packing>
                         </child>
+                        <child>
+                          <object class="GtkCheckButton" id="checkpoint_enabled_checkbutton">
+                            <property name="label" translatable="yes">Enable _checkpoint/restore (CRIU) for tabs in this profile</property>
+                            <property name="use-action-appearance">False</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="tooltip-text" translatable="yes">When enabled, tabs using this profile are spawned inside a PID namespace so they can be checkpointed to disk via CRIU and restored after a reboot. Requires CRIU + python3-pycriu installed and sudo terminator-criu-setup configured. See CRIU.md.</property>
+                            <property name="use-underline">True</property>
+                            <property name="xalign">0</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="on_checkpoint_enabled_checkbutton_toggled" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">4</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="checkpoint_restore_scrollback_checkbutton">
+                            <property name="label" translatable="yes">Restore _scrollback history on checkpoint restore</property>
+                            <property name="use-action-appearance">False</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="tooltip-text" translatable="yes">When a tab is restored from a CRIU checkpoint, also replay the VTE buffer (screen + scrollback) that was visible when the checkpoint was taken. Off means restored tabs start with a clean screen even though the underlying process state is preserved. Only meaningful when checkpoint/restore is enabled.</property>
+                            <property name="use-underline">True</property>
+                            <property name="xalign">0</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="on_checkpoint_restore_scrollback_checkbutton_toggled" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">5</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
                       </object>
                       <packing>
                         <property name="position">1</property>

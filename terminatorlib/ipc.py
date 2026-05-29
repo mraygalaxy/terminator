@@ -237,6 +237,35 @@ class DBusService(Borg, dbus.service.Object):
         else:
             return new_terminal_set[0]
 
+    @dbus.service.method(BUS_NAME, out_signature='u')
+    def criu_checkpoint_all(self):
+        """External "kick" trigger for CRIU auto-checkpointing.
+
+        Snapshot every CRIU-active tab to disk and update the hidden
+        session file, leaving the tabs running. The current dump for
+        each tab (if any) is replaced with a fresh one.
+
+        Intended to be called by external scripts wiring up triggers
+        Terminator itself doesn't subscribe to — screen-saver activation,
+        custom idle daemons, pre-snapshot hooks, etc.:
+
+            dbus-send --session --print-reply               \\
+                --dest=net.tenshu.Terminator2$DISPLAY       \\
+                /net/tenshu/Terminator2                     \\
+                net.tenshu.Terminator2$DISPLAY.criu_checkpoint_all
+
+        (The $DISPLAY suffix matches the existing per-display naming
+        convention used elsewhere in this interface.)
+
+        Returns the number of tabs that were checkpointed (0 if none
+        were CRIU-active, or if checkpointing isn't installed)."""
+        try:
+            return dbus.UInt32(
+                self.terminator.criu_checkpoint_all_tabs(preserve_on_exit=False))
+        except AttributeError:
+            # terminator was installed without CRIU support
+            return dbus.UInt32(0)
+
     @dbus.service.method(BUS_NAME)
     def get_terminals(self):
         """Return a list of all the terminals"""

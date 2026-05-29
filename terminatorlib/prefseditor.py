@@ -629,6 +629,12 @@ class PrefsEditor:
         # Login shell
         widget = guiget('login_shell_checkbutton')
         widget.set_active(self.config['login_shell'])
+        # CRIU checkpoint-enabled per-profile flag
+        widget = guiget('checkpoint_enabled_checkbutton')
+        widget.set_active(bool(self.config['checkpoint_enabled']))
+        # Companion: replay VTE buffer on restore. Defaults to True.
+        widget = guiget('checkpoint_restore_scrollback_checkbutton')
+        widget.set_active(bool(self.config['checkpoint_restore_scrollback']))
         # Use Custom command
         widget = guiget('use_custom_command_checkbutton')
         widget.set_active(self.config['use_custom_command'])
@@ -944,6 +950,23 @@ class PrefsEditor:
     def on_allow_bold_checkbutton_toggled(self, widget):
         """Allow bold setting changed"""
         self.config['allow_bold'] = widget.get_active()
+        self.config.save()
+
+    def on_checkpoint_enabled_checkbutton_toggled(self, widget):
+        """Per-profile CRIU checkpoint-enabled default changed. Only
+        affects new tabs spawned with this profile — existing tabs
+        keep whichever state they were spawned in (the per-tab toggle
+        in the right-click menu can flip an individual tab)."""
+        self.config['checkpoint_enabled'] = widget.get_active()
+        self.config.save()
+
+    def on_checkpoint_restore_scrollback_checkbutton_toggled(self, widget):
+        """Per-profile flag: whether CRIU restore replays the saved
+        VTE buffer (screen + scrollback). Default True. The save side
+        always runs — turning this off only suppresses the replay at
+        restore time, leaving you with the underlying process state
+        and a clean screen."""
+        self.config['checkpoint_restore_scrollback'] = widget.get_active()
         self.config.save()
 
     def on_show_titlebar_toggled(self, widget):

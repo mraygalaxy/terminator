@@ -3,6 +3,8 @@
 """terminal_popup_menu.py - classes necessary to provide a terminal context 
 menu"""
 
+import os
+
 from gi.repository import Gtk, Gdk
 
 from .version import APP_NAME
@@ -12,6 +14,28 @@ from .util import err, dbg, spawn_new_terminator
 from .config import Config
 from .prefseditor import PrefsEditor
 from . import plugin
+
+# Optional CRIU checkpoint/restore integration. The terminatorlib.criu
+# package is only installed when setup.py detected `criu` + `pycriu` at
+# build time, so the import may legitimately fail — fall back to a
+# disabled-but-informative menu item in that case.
+try:
+    from .criu.client import CriuClient, CriuOperationError
+    from .criu.client import checkpoint_dir_for_uuid as _criu_ckpt_dir_for_uuid
+    from .criu import session as _criu_session
+    _criu_client = CriuClient()
+    _criu_unavailable_reason = None
+except ImportError as _imp_err:
+    _criu_client = None
+    CriuOperationError = None
+    _criu_ckpt_dir_for_uuid = None
+    _criu_session = None
+    _criu_unavailable_reason = (
+        "Checkpoint/restore was not included in this build of Terminator. "
+        "Install `criu` and `python3-pycriu`, then re-run "
+        "`python3 setup.py install`, then `sudo terminator-criu-setup`. "
+        "See CRIU.md for details. (import error: %s)" % _imp_err
+    )
 
 class TerminalPopupMenu(object):
     """Class implementing the Terminal context menu"""
@@ -83,6 +107,177 @@ class TerminalPopupMenu(object):
                                 mask,
                                 Gtk.AccelFlags.VISIBLE)
         return item
+
+    def _append_criu_menu_items(self, menu, terminal):
+        """Append the CRIU checkpoint menu items to `menu`.
+
+        Two items get added unconditionally so the feature is discoverable:
+          1. A "Checkpoint capable" toggle reflecting the per-tab opt-in
+             state. Sensitive only when CRIU is fully ready.
+          2. A "Checkpoint this tab" action. Sensitive only when CRIU
+             is ready AND this tab is currently checkpoint-capable.
+             (Action handler comes in a follow-up commit; for now this
+             item is disabled with an explanatory tooltip.)
+        """
+        ready = _criu_client is not None and _criu_client.is_available()
+        # Status text for tooltips when CRIU is NOT ready. status_message()
+        # returns just the cause; we add the menu-context preamble here.
+        if _criu_client is None:
+            unavailable_msg = _criu_unavailable_reason
+        else:
+            unavailable_msg = (
+                'Checkpoint/restore unavailable: %s'
+                % _criu_client.status_message()
+            )
+
+        # Optional suffix for the toggle tooltip showing the last
+        # background auto-checkpoint result. Lifecycle events (sleep,
+        # screen-blank, OS shutdown) can fire while the user isn't
+        # watching, so making the most recent outcome visible in the
+        # right-click menu is the easiest way to surface failures.
+        summary_suffix = ''
+        summary = getattr(self.terminator, 'last_criu_checkpoint_summary',
+                          None)
+        if summary:
+            import time as _time
+            elapsed = int(_time.time() - summary['time'])
+            if elapsed < 90:
+                ago = '%ds ago' % elapsed
+            elif elapsed < 3600:
+                ago = '%dm ago' % (elapsed // 60)
+            else:
+                ago = '%dh ago' % (elapsed // 3600)
+            if summary['failed'] == 0:
+                summary_suffix = (
+                    '\n\nLast auto-checkpoint: %d tab(s), %s, OK.'
+                    % (summary['total'], ago)
+                )
+            else:
+                summary_suffix = (
+                    '\n\nLast auto-checkpoint: %d tab(s), %s, %d FAILED — '
+                    'check stderr or $XDG_STATE_HOME/terminator-criu/helper.log.'
+                    % (summary['total'], ago, summary['failed'])
+                )
+
+        # 1. Per-tab "Checkpoint capable" toggle.
+        toggle = Gtk.CheckMenuItem.new_with_mnemonic(
+            _('Checkpoint c_apable'))
+        toggle.set_active(bool(terminal.checkpoint_enabled))
+        # Whether this tab is *actually* in a PID namespace right now
+        # (decided once at spawn time; can't change mid-life).
+        in_ns = terminal._criu_helper_proc is not None
+        if ready:
+            if in_ns:
+                toggle.set_tooltip_text(_(
+                    'This tab is running inside a PID namespace and can '
+                    'be checkpointed. Toggling this off marks the tab as '
+                    '"do not checkpoint" — useful for the future '
+                    '"Checkpoint all tabs" action.'
+                ) + summary_suffix)
+            else:
+                toggle.set_tooltip_text(_(
+                    'This tab was spawned WITHOUT checkpoint capability '
+                    '(its profile had checkpoint_enabled=False at spawn '
+                    'time). Toggling this on cannot retroactively '
+                    'namespace the running process — you would need to '
+                    'close this tab and open a new one whose profile has '
+                    'checkpoint_enabled=True.'
+                ) + summary_suffix)
+            toggle.connect('toggled',
+                lambda x: self._on_checkpoint_capable_toggled(terminal, x))
+        else:
+            # Reflect the stored state but disable changes when the
+            # feature isn't usable on this system.
+            toggle.set_sensitive(False)
+            toggle.set_tooltip_text(_(unavailable_msg))
+        menu.append(toggle)
+
+        # 2. "Checkpoint this tab now" action. Enabled iff CRIU is
+        # ready AND this specific tab is actually in a PID namespace
+        # AND the user hasn't toggled it off via the item above.
+        action = Gtk.MenuItem.new_with_mnemonic(_('C_heckpoint this tab'))
+        if ready and in_ns and terminal.checkpoint_enabled:
+            action.set_sensitive(True)
+            action.set_tooltip_text(_(
+                "Snapshot this tab's processes to disk. The tab keeps "
+                "running afterwards — the dump becomes a restore-point "
+                "you can come back to after a reboot."
+            ))
+            action.connect('activate',
+                lambda x: self._on_checkpoint_now(terminal))
+        elif ready and not in_ns:
+            action.set_sensitive(False)
+            action.set_tooltip_text(_(
+                'This tab was not spawned with checkpoint capability so '
+                'CRIU has nothing to dump. Open a new tab with a profile '
+                'that has checkpoint_enabled=True.'
+            ))
+        elif ready and not terminal.checkpoint_enabled:
+            action.set_sensitive(False)
+            action.set_tooltip_text(_(
+                'Enable "Checkpoint capable" above to allow snapshotting '
+                'this tab.'
+            ))
+        else:
+            action.set_sensitive(False)
+            action.set_tooltip_text(_(unavailable_msg))
+        menu.append(action)
+
+    def _on_checkpoint_now(self, terminal):
+        """Handler for the "Checkpoint this tab" menu action."""
+        if _criu_client is None or _criu_ckpt_dir_for_uuid is None:
+            return
+        ckpt_dir = _criu_ckpt_dir_for_uuid(terminal.uuid.hex)
+        # Wipe a stale prior dump so the re-dump replaces cleanly, then
+        # save scrollback alongside the CRIU images. Same flow as the
+        # auto-checkpoint path in terminal._criu_auto_checkpoint().
+        if os.path.isdir(ckpt_dir):
+            try:
+                import shutil as _sh
+                _sh.rmtree(ckpt_dir, ignore_errors=True)
+            except Exception:
+                pass
+        try:
+            os.makedirs(ckpt_dir, exist_ok=True)
+        except OSError:
+            pass
+        terminal._save_scrollback(ckpt_dir)
+        try:
+            _criu_client.dump(terminal.pid, ckpt_dir, leave_running=True)
+        except Exception as e:
+            terminal._feed_error(
+                'Checkpoint failed: %s' % e
+            )
+            return
+
+        # Persist the current arrangement to the hidden session file so
+        # the next terminator launch can restore this tab in the same
+        # spatial position. describe_layout records criu_restore=True
+        # for any tab with a checkpoint dir on disk.
+        session_msg = ''
+        if _criu_session is not None:
+            try:
+                layout = self.terminator.describe_layout(save_cwd=True)
+                _criu_session.save(layout)
+                session_msg = (
+                    '\r\nSession saved — this tab will reappear on '
+                    'next terminator launch.'
+                )
+            except Exception as e:
+                session_msg = '\r\n(session save failed: %s)' % e
+
+        terminal._feed_error(
+            'Checkpointed to %s\r\n(tab continues running; this dump is '
+            'a saved restore-point)%s' % (ckpt_dir, session_msg)
+        )
+
+    @staticmethod
+    def _on_checkpoint_capable_toggled(terminal, item):
+        new_state = bool(item.get_active())
+        if terminal.checkpoint_enabled == new_state:
+            return
+        terminal.checkpoint_enabled = new_state
+        dbg('terminal %s: checkpoint_enabled -> %s' % (terminal, new_state))
 
     def show(self, widget, event=None):
         """Display the context menu"""
@@ -226,6 +421,11 @@ class TerminalPopupMenu(object):
         item = self.menu_item(Gtk.ImageMenuItem, 'close_term', _('_Close'))
         item.connect('activate', lambda x: terminal.close())
         menu.append(item)
+
+        # CRIU checkpoint/restore menu item. Always shown so the feature
+        # is discoverable; gated by client availability + a "wiring in
+        # progress" guard until terminal.py learns to spawn via the helper.
+        self._append_criu_menu_items(menu, terminal)
 
         menu.append(Gtk.SeparatorMenuItem())
 

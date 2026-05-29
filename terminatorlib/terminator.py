@@ -213,19 +213,27 @@ class Terminator(Borg):
 
         return(window, terminal)
 
-    def create_layout(self, layoutname):
-        """Create all the parts necessary to satisfy the specified layout"""
-        layout = None
+    def create_layout(self, layoutname, layout=None):
+        """Create all the parts necessary to satisfy the specified layout.
+
+        If `layout` is given (a layout dict), use it directly instead of
+        looking up `layoutname` in the config. This lets callers feed
+        in an auto-saved CRIU session without registering it as a
+        user-facing named layout.
+        """
         objects = {}
 
         self.doing_layout = True
         self.last_active_window = None
         self.prelayout_windows = self.windows[:]
 
-        layout = copy.deepcopy(self.config.layout_get_config(layoutname))
+        if layout is None:
+            layout = copy.deepcopy(self.config.layout_get_config(layoutname))
+        else:
+            layout = copy.deepcopy(layout)
         if not layout:
             # User specified a non-existent layout. default to one Terminal
-            err('layout %s not defined' % layout)
+            err('layout %s not defined' % layoutname)
             self.new_window()
             return
 
@@ -639,6 +647,60 @@ class Terminator(Borg):
             count = window.describe_layout(count, parent, layout, 0, save_cwd)
 
         return(layout)
+
+    last_criu_checkpoint_summary = None
+
+    def criu_checkpoint_all_tabs(self, preserve_on_exit):
+        """Auto-checkpoint every CRIU-active tab across every window
+        and persist the session to disk.
+
+        preserve_on_exit:
+          - True  → the caller expects tabs to die imminently (window
+                    close, OS shutdown). Set the preserve flag so the
+                    child-exited cleanup keeps the dump dirs around for
+                    restore on next launch.
+          - False → tabs will keep running afterwards (laptop sleep,
+                    external DBus kick). Dumps are taken as a safety
+                    net; a later clean exit (Ctrl-D) still wipes them
+                    via the normal cleanup, which matches the user
+                    intent of "clean exit means I'm done".
+
+        No-op when no tab is CRIU-active — we don't auto-write a
+        session.json for users who never opted into checkpointing.
+        Returns the number of tabs that were checkpointed.
+        """
+        criu_tabs = [t for t in self.terminals
+                     if getattr(t, '_criu_active', False)]
+        if not criu_tabs:
+            return 0
+        if preserve_on_exit:
+            for t in criu_tabs:
+                t._criu_preserve_checkpoint_on_exit = True
+        failed = 0
+        for t in criu_tabs:
+            if not t._criu_auto_checkpoint():
+                failed += 1
+        try:
+            from .criu import session as _criu_sess
+            _criu_sess.save(self.describe_layout(save_cwd=True))
+        except ImportError:
+            pass
+        except Exception as e:
+            err('CRIU session save failed: %s' % e)
+        # Stash a summary so the popup-menu code can surface it as a
+        # tooltip — gives users a hint that a background auto-checkpoint
+        # (sleep, screen-blank, etc.) succeeded or failed, since they
+        # may have been away from the keyboard when it happened.
+        import time as _time
+        self.last_criu_checkpoint_summary = {
+            'time':     _time.time(),
+            'total':    len(criu_tabs),
+            'failed':   failed,
+            'preserve': preserve_on_exit,
+        }
+        dbg('CRIU: auto-checkpointed %d tab(s) (%d failed; preserve_on_exit=%s)'
+            % (len(criu_tabs), failed, preserve_on_exit))
+        return len(criu_tabs)
 
     def zoom_in_all(self):
         for term in self.terminals:

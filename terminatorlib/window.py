@@ -286,14 +286,37 @@ class Window(Container, Gtk.Window):
         if (maker.isinstance(child, 'Terminal') or
             maker.isinstance(child, 'Container')):
             confirm_close = self.construct_confirm_close(window, child)
-            return (confirm_close != Gtk.ResponseType.ACCEPT)
+            veto = (confirm_close != Gtk.ResponseType.ACCEPT)
         else:
             dbg('unknown child: %s' % child)
-            return False # close anyway
+            veto = False  # close anyway
+
+        # If we're letting close proceed, snapshot the CRIU session NOW —
+        # before GTK fires 'destroy' and tears down the widget tree
+        # (which is too late: by then self.terminator.describe_layout()
+        # returns {}). Also set the preserve flag so the child-exited
+        # cleanup keeps the checkpoint dirs around for restore on next
+        # launch.
+        if not veto:
+            self._criu_save_session_and_preserve_checkpoints()
+        return veto
+
+    def _criu_save_session_and_preserve_checkpoints(self):
+        """On window close: tabs in this window are about to die.
+        Delegate to the terminator-wide method which captures all
+        windows' arrangements into session.json — useful for the
+        multi-window case where one window closes while others
+        remain alive.
+        """
+        try:
+            self.terminator.criu_checkpoint_all_tabs(preserve_on_exit=True)
+        except AttributeError:
+            pass  # built without CRIU support
 
     def on_destroy_event(self, widget, data=None):
         """Handle window destruction"""
         dbg('destroying self')
+
         for terminal in self.get_terminals():
             # Only for race condition, while closing a window with a single
             # terminal. Could be useful in other scenarios.

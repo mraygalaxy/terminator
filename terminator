@@ -130,7 +130,52 @@ if __name__ == '__main__':
 
         try:
             dbg('Creating a terminal with layout: %s' % OPTIONS.layout)
-            TERMINATOR.create_layout(OPTIONS.layout)
+            # If terminator was launched without an explicit --layout
+            # flag (i.e. defaulted to 'default'), check for a hidden
+            # CRIU session and load it in place. This is what restores
+            # the user's last working arrangement — with any
+            # checkpointed tabs hooked up to restore via criu — without
+            # them having to think about layouts. An explicit
+            # --layout=NAME bypasses session loading and uses the
+            # named template fresh.
+            criu_session_layout = None
+            if OPTIONS.layout == 'default':
+                try:
+                    from terminatorlib.criu import session as _criu_sess
+                    criu_session_layout = _criu_sess.load()
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    err('CRIU session load failed, falling back to default: %s' % _e)
+            if criu_session_layout is not None:
+                dbg('Loading CRIU session in place of default layout')
+                TERMINATOR.create_layout(OPTIONS.layout, layout=criu_session_layout)
+                # Session is one-shot — having processed it, clear so the
+                # next launch starts clean unless the user checkpoints
+                # again or closes-with-tabs (which would re-write it).
+                # Also sweep any checkpoint dirs not referenced by the
+                # session we just loaded — those are orphans from a
+                # crash or weird shutdown and would otherwise sit on
+                # disk forever.
+                try:
+                    keep = _criu_sess.referenced_uuids(criu_session_layout)
+                    _criu_sess.remove_orphan_checkpoints(keep)
+                    _criu_sess.clear()
+                except Exception as _e:
+                    err('CRIU session cleanup failed: %s' % _e)
+            else:
+                TERMINATOR.create_layout(OPTIONS.layout)
+            # Wire up the logind PrepareForShutdown / PrepareForSleep
+            # listeners so power events trigger auto-checkpointing. The
+            # import is guarded so terminator still works on systems
+            # without the criu module installed or without systemd-logind.
+            try:
+                from terminatorlib.criu import lifecycle as _criu_lifecycle
+                _criu_lifecycle.install(TERMINATOR)
+            except ImportError:
+                pass
+            except Exception as _e:
+                err('CRIU lifecycle install failed: %s' % _e)
         except (KeyError,ValueError) as ex:
             err('layout creation failed, creating a window ("%s")' % ex)
             TERMINATOR.new_window()
@@ -148,5 +193,13 @@ if __name__ == '__main__':
     try:
         Gtk.main()
     except KeyboardInterrupt:
-        pass
+        # User hit Ctrl-C in the launching terminal. Same semantic as
+        # an OS shutdown — terminator is about to die and the user
+        # wants their tabs back next launch. Skip silently if CRIU
+        # isn't wired up.
+        try:
+            if hasattr(TERMINATOR, 'criu_checkpoint_all_tabs'):
+                TERMINATOR.criu_checkpoint_all_tabs(preserve_on_exit=True)
+        except Exception as _e:
+            err('CRIU checkpoint on Ctrl-C failed: %s' % _e)
 

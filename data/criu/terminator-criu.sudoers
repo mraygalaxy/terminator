@@ -1,0 +1,22 @@
+# Terminator CRIU helper — sudoers fragment.
+#
+# Members of the terminator-criu group are allowed to invoke the helper
+# at its fixed install path as root, with no password prompt. Only the
+# four supported subcommands are accepted; anything else falls through
+# to normal sudo policy.
+#
+# The helper itself drops privileges before exec'ing user processes and
+# chowns its artifacts back to the caller — so granting this rule is
+# narrower than it looks. Audit the helper at
+# /usr/local/bin/terminator-criu-helper before deploying.
+#
+# This file is NOT auto-installed by `python3 setup.py install`. Run
+# `sudo terminator-criu-setup` to validate and install it under
+# /etc/sudoers.d/. Always validate any sudoers file with `visudo -c`
+# before deploying.
+
+%terminator-criu ALL=(root:root) NOPASSWD: \
+    /usr/local/bin/terminator-criu-helper check, \
+    /usr/local/bin/terminator-criu-helper spawn *, \
+    /usr/local/bin/terminator-criu-helper dump *, \
+    /usr/local/bin/terminator-criu-helper restore *

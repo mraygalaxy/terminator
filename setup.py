@@ -16,6 +16,47 @@ import platform
 
 from terminatorlib.version import APP_NAME, APP_VERSION
 
+
+def _criu_available():
+    """Return True iff CRIU and the pycriu Python bindings are both
+    present on the build/install system.
+
+    The checkpoint/restore feature is strictly opt-in. If either
+    dependency is missing we skip every CRIU-related file from the
+    install — terminator will install and run as a normal terminal
+    emulator. To enable later, install `criu` + `python3-pycriu` and
+    re-run `python3 setup.py install`.
+    """
+    import importlib.util
+    import shutil as _sh
+    if not _sh.which('criu'):
+        return False
+    if importlib.util.find_spec('pycriu') is None:
+        return False
+    return True
+
+
+CRIU_AVAILABLE = _criu_available()
+
+# Direct print (not distutils.log.info) so the detection result is
+# visible at default verbosity — admins running `setup.py install`
+# should know whether they got the optional CRIU integration.
+if CRIU_AVAILABLE:
+    print("setup.py: CRIU + pycriu detected — including "
+          "checkpoint/restore integration", file=sys.stderr)
+else:
+    print("setup.py: CRIU/pycriu not detected — skipping "
+          "checkpoint/restore integration (install `criu` + "
+          "`python3-pycriu` and re-run setup.py to enable)",
+          file=sys.stderr)
+
+CRIU_SCRIPTS = ['libexec/terminator-criu-helper',
+                'libexec/terminator-criu-setup'] if CRIU_AVAILABLE else []
+CRIU_DATA_FILES = [('share/terminator/criu',
+                    ['data/criu/terminator-criu.sudoers'])] if CRIU_AVAILABLE else []
+CRIU_PACKAGES = ['terminatorlib.criu'] if CRIU_AVAILABLE else []
+
+
 PO_DIR = 'po'
 MO_DIR = os.path.join('build', 'mo')
 CSS_DIR = os.path.join('terminatorlib', 'themes')
@@ -191,7 +232,9 @@ setup(name=APP_NAME,
       author_email='cmsj@tenshu.net',
       url='https://github.com/gnome-terminator/terminator',
       license='GNU GPL v2',
-      scripts=['terminator', 'remotinator'],
+      # CRIU_SCRIPTS / CRIU_DATA_FILES / CRIU_PACKAGES are empty unless
+      # both `criu` and `pycriu` were detected at the top of this file.
+      scripts=['terminator', 'remotinator'] + CRIU_SCRIPTS,
       data_files=[
                   ('share/applications', ['data/terminator.desktop']),
                   ('share/metainfo', ['data/terminator.metainfo.xml']),
@@ -214,11 +257,11 @@ setup(name=APP_NAME,
                   ('share/icons/HighContrast/48x48/apps', glob.glob('data/icons/HighContrast/48x48/apps/*.png')),
                   ('share/icons/HighContrast/16x16/actions', glob.glob('data/icons/HighContrast/16x16/actions/*.png')),
                   ('share/icons/HighContrast/16x16/status', glob.glob('data/icons/HighContrast/16x16/status/*.png')),
-                 ],
+                 ] + CRIU_DATA_FILES,
       packages=[
           'terminatorlib',
           'terminatorlib.plugins',
-      ],
+      ] + CRIU_PACKAGES,
       install_requires=[
           'pycairo',
           'configobj',
@@ -230,4 +273,31 @@ setup(name=APP_NAME,
       package_data={'terminatorlib': ['preferences.glade', 'layoutlauncher.glade']},
       cmdclass={'build': BuildData, 'install_data': InstallData, 'uninstall': Uninstall},
       distclass=TerminatorDist)
+
+
+# Post-install reminder for the CRIU integration. setup.py only places
+# files; the sudoers/group/user-add bits are a deliberate opt-in handled
+# by `terminator-criu-setup`. After a long install run the user can
+# easily miss that there's a second step, so print a banner now.
+#
+# Guard: only if CRIU was actually included AND this invocation did an
+# install (not just `build`, `sdist`, `--help`, etc.).
+if CRIU_AVAILABLE and 'install' in sys.argv:
+    msg = """
+================================================================
+  Terminator's CRIU checkpoint/restore integration was included.
+
+  ONE MORE STEP to enable it:
+
+      sudo terminator-criu-setup
+
+  That creates the `terminator-criu` group, installs a validated
+  /etc/sudoers.d/terminator-criu, and adds you to the group.
+  Log out and back in (or run `newgrp terminator-criu`) for the
+  group membership to apply.
+
+  See CRIU.md in the source tree for the full design.
+================================================================
+"""
+    print(msg, file=sys.stderr)
 

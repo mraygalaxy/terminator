@@ -269,7 +269,20 @@ DEFAULTS = {
                 'title_inactive_fg_color' : '#000000',
                 'title_inactive_bg_color' : '#c0bebf',
                 'title_use_system_font'   : True,
-                'title_font'              : 'Sans 9'
+                'title_font'              : 'Sans 9',
+                # CRIU checkpoint/restore opt-in (per-profile default).
+                # When True, new tabs using this profile are spawned via
+                # the terminator-criu-helper inside a PID+mount namespace
+                # so they can be checkpointed to disk and restored later.
+                # Individual tabs can be toggled off after creation via
+                # the right-click menu. False on all profiles by default;
+                # see CRIU.md for the threat model and install steps.
+                'checkpoint_enabled'      : False,
+                # Replay the saved VTE buffer (screen + scrollback) on
+                # restore, so the visible history is preserved across
+                # checkpoints. True by default; turn off if you prefer
+                # restored tabs to start with a clean screen.
+                'checkpoint_restore_scrollback': True
             },
         },
         'layouts': {
