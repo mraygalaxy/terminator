@@ -433,6 +433,39 @@ gracefully but can't make them work:
   using io_uring at scale) are fragile under c/r. Native shells,
   vim/emacs, less, ssh, REPLs (Python, Ruby, etc.) work reliably.
 
+### Foreign PID namespace and `sudo systemctl` (resolved)
+
+`sudo systemctl ...` from inside a CRIU tab used to fail with:
+
+```
+Failed to connect to bus: No data available
+```
+
+Why: systemctl-as-root connects to `/run/systemd/private`, the
+direct-to-PID-1 socket. systemd refuses connections from clients in
+a different PID namespace by design — it compares `/proc/<peer>/ns/pid`
+against its own and HUPs the socket if they differ. This is a
+deliberate security boundary, not a bug; there's no config flag to
+disable it. Our CLONE_NEWPID is mandatory for CRIU's stable-PID
+restore guarantee, so we can't sidestep the check by joining systemd's
+PID namespace either.
+
+**Resolution**: systemd already ships an opt-out env var for exactly
+this — `SYSTEMCTL_FORCE_BUS=1` routes systemctl through the
+dbus-daemon broker (`/run/dbus/system_bus_socket`) instead of the
+private socket. dbus-daemon authenticates by UID via SCM_CREDENTIALS,
+which works across PID namespaces. The integration sets this env var
+unconditionally on tab spawn (in `cmd_spawn`'s env backfill) and adds
+`Defaults env_keep += "SYSTEMCTL_FORCE_BUS"` to the sudoers fragment
+so the variable survives `sudo`. After both, `sudo systemctl ...` just
+works from a CRIU tab.
+
+This affected ONLY `sudo systemctl`. All other systemd client tools
+(`journalctl`, `loginctl`, `hostnamectl`, `timedatectl`, `localectl`,
+`machinectl`, `busctl`, and user-mode `systemctl`) already go through
+dbus-daemon and worked from inside the namespace without any
+intervention.
+
 ## Notes on intentional design choices
 
 **The hidden session captures the *whole* arrangement, not just CRIU
