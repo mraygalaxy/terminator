@@ -20,3 +20,13 @@
     /usr/local/bin/terminator-criu-helper spawn *, \
     /usr/local/bin/terminator-criu-helper dump *, \
     /usr/local/bin/terminator-criu-helper restore *
+
+# Preserve SYSTEMCTL_FORCE_BUS across `sudo` so `sudo systemctl ...`
+# works from inside a CRIU tab. Without this, sudo strips the var
+# and root systemctl falls back to /run/systemd/private, which
+# systemd refuses from our foreign PID namespace. Globally scoped
+# rather than scoped to %terminator-criu — the variable is
+# meaningless outside CRIU tabs (it just routes systemctl through
+# dbus-daemon, which is what a regular systemctl-as-user does
+# anyway), so the cost on the host is zero.
+Defaults env_keep += "SYSTEMCTL_FORCE_BUS"

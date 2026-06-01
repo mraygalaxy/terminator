@@ -334,6 +334,18 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
     env.setdefault("TERM", os.environ.get("TERM", "xterm-256color"))
+    # Force systemctl through the dbus-daemon broker instead of
+    # /run/systemd/private. The spawned program lives in a PID
+    # namespace foreign to systemd PID 1, and systemd refuses
+    # bus connections from foreign PID namespaces by design.
+    # dbus-daemon authenticates by UID via SCM_CREDENTIALS, which
+    # works across PID namespaces. Direct assignment (not
+    # setdefault) so an inherited unset value doesn't reintroduce
+    # the breakage — the PID-NS isolation makes this workaround
+    # mandatory for the CRIU model. Sudoers env_keep carries the
+    # variable across `sudo systemctl`; see
+    # data/criu/terminator-criu.sudoers.
+    env["SYSTEMCTL_FORCE_BUS"] = "1"
     # Respect the caller-requested cwd if it's still a valid directory
     # (the user may have rm'd it between sessions, or restart-fresh
     # may be pointing at a stale path). Fall back to HOME so we never
