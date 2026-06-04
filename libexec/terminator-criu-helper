@@ -310,9 +310,17 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
     if slave > 2:
         os.close(slave)
 
-    # Drop privileges. Order matters: gid before uid.
+    # Drop privileges. Order matters: supplementary groups + gid
+    # before uid (once we lose uid 0 we can't change groups any
+    # more). initgroups() looks the user's group memberships up
+    # from /etc/group so docker/audio/video/plugdev/etc. all work
+    # inside the namespace the same way they do in a regular
+    # shell. `setgroups([])` (what we used to do here) cleared all
+    # supplementary groups and silently broke any group-gated
+    # access — e.g. `docker ps` failing with "permission denied
+    # while trying to connect to the docker API."
     pw = pwd.getpwuid(uid)
-    os.setgroups([])
+    os.initgroups(pw.pw_name, gid)
     os.setgid(gid)
     os.setuid(uid)
 
