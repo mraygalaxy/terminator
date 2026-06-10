@@ -133,3 +133,50 @@ def remove_orphan_checkpoints(keep_uuids):
             shutil.rmtree(full, ignore_errors=True)
             removed += 1
     return removed
+
+
+def drop(uuid_hex):
+    """Invalidate one tab's checkpoint after an intentional teardown — the
+    user typed `exit`/Ctrl-D or clicked the per-tab 'x'. Deletes the tab's
+    checkpoint dir and clears its `criu_restore` flag in the saved session so
+    it is never recovered on the next launch. When no tab remains flagged for
+    restore, the whole session file is removed (clean slate).
+
+    A clean per-tab exit is authoritative: it overrides a checkpoint made by
+    "Checkpoint this tab", sleep, or a screensaver/DBus kick. Only the
+    whole-window close and power-loss recovery keep their checkpoints — those
+    go through the preserve path and never call here.
+    """
+    key = str(uuid_hex).replace("-", "").lower()
+    import shutil
+    shutil.rmtree(os.path.join(_checkpoints_root(), key), ignore_errors=True)
+    layout = load()
+    if not isinstance(layout, dict):
+        return
+    for entry in layout.values():
+        if isinstance(entry, dict) and \
+                str(entry.get("uuid", "")).replace("-", "").lower() == key:
+            entry["criu_restore"] = False
+    if referenced_uuids(layout):
+        # Other tabs still want restoring — persist the reduced session.
+        path = session_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_coerce_for_json(layout), f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    else:
+        # Nothing left to restore — remove the session file so the next
+        # launch starts clean (save() refuses empty layouts, so clear here).
+        clear()
+
+
+def save_or_clear(layout):
+    """Persist `layout`, or remove the session file when nothing in it is
+    flagged for restore. Used after an intentional tab close: re-deriving the
+    live layout drops the closed tab's entry, and once the last restorable tab
+    is gone the session file is removed (clean slate). Unlike save(), this does
+    NOT keep a stale file around when there's nothing left to restore."""
+    if referenced_uuids(layout):
+        save(layout)
+    else:
+        clear()

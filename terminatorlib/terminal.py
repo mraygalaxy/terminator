@@ -26,6 +26,7 @@ try:
     from .criu.client import wipe_failed_checkpoint as _criu_wipe_failed
     from .criu.client import is_complete_checkpoint as _criu_is_complete
     from .criu.client import SCROLLBACK_FILENAME as _CRIU_SCROLLBACK_FILENAME
+    from .criu import session as _criu_session
     _criu_client = _CriuClient()
 except ImportError:
     _CriuClient = None
@@ -34,6 +35,7 @@ except ImportError:
     _CriuStatus = None
     _criu_ckpt_dir_for_uuid = None
     _criu_wipe_failed = None
+    _criu_session = None
     _criu_is_complete = None
     _CRIU_SCROLLBACK_FILENAME = None
     _criu_client = None
@@ -2201,13 +2203,51 @@ class Terminal(Gtk.VBox):
             dbg('CRIU helper reap failed: %s' % e)
         self._criu_helper_proc = None
 
-        # 2. Delete the tab's checkpoint dir, unless explicitly told to
-        # keep it for cross-restart restore.
+        # 2. Decide the checkpoint's fate by the SOURCE of the close, not the
+        # exit status (the per-tab 'x'/right-click-Close/Shift+Ctrl+W paths
+        # kill the shell via SIGHUP, so they're not "clean" WIFEXITED exits —
+        # but the user still meant to throw the tab away).
+        #
+        # _criu_preserve_checkpoint_on_exit is set ONLY by the whole-window X
+        # and OS-shutdown path (criu_checkpoint_all_tabs(preserve_on_exit=
+        # True)). EVERY individual teardown of a single tab — typing
+        # exit/Ctrl-D, the per-tab 'x', right-click → Close, Shift+Ctrl+W —
+        # runs with it False and means "I'm done with this tab, throw it
+        # away": invalidate the checkpoint so it is never recovered.
+        #
+        # (Sleep/screensaver checkpoints leave tabs running with the flag
+        # False; on real power loss no child-exited fires, so session.json +
+        # the dumps survive and ARE recovered — exactly as intended.)
         if self._criu_preserve_checkpoint_on_exit:
-            dbg('CRIU: preserving checkpoint dir for tab %s' % self.uuid)
+            dbg('CRIU: preserving checkpoint for tab %s (window close/shutdown)'
+                % self.uuid)
             return
+        # Intentional per-tab teardown -> invalidate: drop() deletes the dump
+        # dir AND clears the tab's criu_restore flag in the saved session
+        # (removing session.json entirely when nothing else wants restoring),
+        # so a thrown-away tab never reappears on next launch.
+        if _criu_session is not None:
+            try:
+                _criu_session.drop(self.uuid.hex)
+            except Exception as e:
+                err('CRIU: failed to invalidate checkpoint for %s: %s'
+                    % (self.uuid, e))
+            # drop() clears this tab's restore flag immediately; additionally
+            # remove its layout entry entirely so a thrown-away tab never
+            # reappears (not even as a fresh shell). Deferred to idle so
+            # describe_layout() reflects terminator's collapse of the now-gone
+            # tab. The callback only touches an existing session and clears it
+            # when nothing restorable remains.
+            try:
+                GLib.idle_add(self._criu_resave_session_after_close)
+            except Exception as e:
+                err('CRIU: could not schedule session re-save: %s' % e)
+            dbg('CRIU: invalidated checkpoint for tab %s (intentional close)'
+                % self.uuid)
+            return
+        # Fallback if the session module isn't importable: at least wipe the dir.
         if _criu_ckpt_dir_for_uuid is None:
-            return  # CRIU package wasn't installed; nothing to delete
+            return
         ckpt_dir = _criu_ckpt_dir_for_uuid(self.uuid.hex)
         if os.path.isdir(ckpt_dir):
             try:
@@ -2216,6 +2256,24 @@ class Terminal(Gtk.VBox):
                 dbg('CRIU: deleted stale checkpoint dir %s' % ckpt_dir)
             except Exception as e:
                 err('CRIU: failed to delete %s: %s' % (ckpt_dir, e))
+
+    def _criu_resave_session_after_close(self):
+        """After an intentional tab close, re-derive the saved session from the
+        LIVE layout so the closed tab is removed entirely — it must never
+        reappear, not even as a fresh shell. Runs at idle so describe_layout()
+        reflects the tab's removal and terminator's pane/notebook collapse.
+
+        Only maintains an EXISTING session (never creates one); save_or_clear()
+        drops session.json when nothing restorable is left. One-shot idle."""
+        if _criu_session is None:
+            return False
+        try:
+            if _criu_session.load() is not None:
+                _criu_session.save_or_clear(
+                    self.terminator.describe_layout(save_cwd=True))
+        except Exception as e:
+            err('CRIU: post-close session re-save failed: %s' % e)
+        return False
 
     def _feed_error(self, message):
         """Write a human-readable error into the VTE widget so the user

@@ -37,6 +37,7 @@ import os
 import pwd
 import signal
 import subprocess
+import fcntl
 import sys
 import tempfile
 
@@ -66,6 +67,41 @@ _libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
 _libc.umount2.restype = ctypes.c_int
 
 MNT_DETACH = 2  # lazy unmount
+
+# No-PID-namespace model: tabs run in the host pidns (so /proc is host-view and
+# top/ps/systemctl work). To keep checkpoint/restore collision-free we steer the
+# spawn into a high PID band, above the PIDs a freshly-booted system hands out,
+# so the original PIDs are free on restore. pid_max is hard-capped at 2**22.
+_HIGH_PID_BASE = (1 << 22) - 100000
+_SPAWN_LOCK_PATH = "/run/terminator-criu-spawn.lock"
+
+
+def _kill_session(sid: int) -> None:
+    """Kill every process in session `sid`. The tab's shell calls setsid(), so
+    its session id equals its PID and every descendant shares it. Replaces the
+    PID-namespace-init teardown (kill init -> kill all) now that tabs live in
+    the host pidns: sweep the session to catch backgrounded/orphaned jobs."""
+    me = os.getpid()
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return
+    for name in names:
+        if not name.isdigit() or int(name) == me:
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                data = f.read()
+            # fields after the "(comm)" blob: state ppid pgrp session ...
+            tail = data[data.rfind(b")") + 2:].split()
+            if int(tail[3]) != sid:
+                continue
+        except (OSError, ValueError, IndexError):
+            continue
+        try:
+            os.kill(int(name), signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def unshare(flags: int) -> None:
@@ -126,7 +162,7 @@ def set_pdeathsig(sig: int) -> None:
 _PRUNE_PREFIXES = (
     "/sys/fs/cgroup",
     "/run/snapd/ns",
-    "/proc",
+    # /proc intentionally NOT pruned — keep the inherited host /proc.
 )
 
 # Additional surgical rule for fuse mounts under /run/user/<uid>: the
@@ -248,23 +284,55 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
     # passed (we fall back to a hardcoded minimum below).
     caller_env = _load_env_file(env_file) if env_file else {}
 
-    unshare(CLONE_NEWPID | CLONE_NEWNS)
+    # No CLONE_NEWPID: stay in the host pidns so /proc is host-view (top/ps/
+    # systemctl all work). CRIU restores exact PIDs in the host pidns via
+    # clone3(set_tid); we steer the spawn into a high PID band (below) to make
+    # restore-time collisions rare and rely on EEXIST-on-restore for the rest.
+    unshare(CLONE_NEWNS)
 
     # CRITICAL: detach from the host's mount propagation BEFORE any mount,
-    # or our /proc mount escapes to the host. See feedback memory.
+    # or our mounts escape to the host. See feedback memory.
     make_root_rprivate()
 
-    # After unshare(CLONE_NEWPID), the first fork()'d child becomes PID 1
-    # of the new namespace.
+    # Steer the next host PID into the high band. ns_last_pid is a single global
+    # counter, so serialize spawns with a lock held across the fork; a concurrent
+    # system fork can still bump it (best-effort — we log if the result lands
+    # low, and the EEXIST-on-restore path is the real safety net).
+    _steer_lock = open(_SPAWN_LOCK_PATH, "w")
+    fcntl.flock(_steer_lock, fcntl.LOCK_EX)
+    try:
+        with open("/proc/sys/kernel/ns_last_pid", "w") as _nlp:
+            _nlp.write(str(_HIGH_PID_BASE))
+    except OSError as _e:
+        print(f"ns_last_pid steer failed: {_e} (PID will be unbanded)",
+              file=sys.stderr, flush=True)
+
     pid = os.fork()
+    try:
+        fcntl.flock(_steer_lock, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    _steer_lock.close()
     if pid != 0:
-        # Parent: still in host ns. Report child host-PID via temp file
-        # (atomically — write to .tmp then rename), then act as init by
-        # waiting for the child.
+        # Parent: supervisor in the host pidns. Warn if steering didn't land
+        # high (more collision-prone on restore), then report the child
+        # host-PID atomically (write .tmp, rename).
+        if pid < _HIGH_PID_BASE:
+            print(f"WARN: PID {pid} landed below the high band {_HIGH_PID_BASE}; "
+                  f"this tab is more collision-prone on restore (EEXIST fallback "
+                  f"still applies).", file=sys.stderr, flush=True)
         tmp_path = report_path + ".tmp"
         with open(tmp_path, "w") as f:
             f.write(f"{pid}\n")
         os.rename(tmp_path, report_path)
+        # Teardown without a PID namespace: on SIGTERM (the driver's
+        # helper.terminate()) sweep the shell's whole session; also sweep after
+        # the shell exits to reap backgrounded/orphaned descendants. Replaces
+        # the old "kill the pidns init -> kill everything in the namespace".
+        def _term(_signum, _frame):
+            _kill_session(pid)
+            os._exit(0)
+        signal.signal(signal.SIGTERM, _term)
         try:
             while True:
                 done_pid, _status = os.wait()
@@ -272,11 +340,12 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
                     break
         except ChildProcessError:
             pass
+        _kill_session(pid)
         sys.exit(0)
 
-    # Child: PID 1 of new namespace. Same pdeathsig dance — if the
-    # helper-parent dies, this child (and via PID-ns init semantics,
-    # everything in the namespace) should also die.
+    # Child: the tab's session leader, in the host pidns. pdeathsig ties its
+    # life to the helper-parent; the parent's session sweep on exit/SIGTERM
+    # cleans up descendants (no pidns-init to do it automatically anymore).
     set_pdeathsig(signal.SIGKILL)
     print(f"=== child pid={os.getpid()} starting ===", file=sys.stderr, flush=True)
 
@@ -287,21 +356,18 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
     _prune_inherited_mounts()
     print("pruned mounts ok", file=sys.stderr, flush=True)
 
-    # Mount a private /proc so tools inside see only this namespace.
-    # Safe to do now that root is MS_PRIVATE — won't propagate to host.
-    subprocess.run(
-        ["mount", "-t", "proc", "-o", "nosuid,noexec,nodev", "proc", "/proc"],
-        check=True,
-    )
-    print("mounted /proc ok", file=sys.stderr, flush=True)
+    # Keep the inherited host /proc (no namespace-local remount): the tab is in
+    # the host pidns, so host-view /proc is correct and lets top/ps/systemctl
+    # work, and CRIU's parasite takes the fast path (no proc-fd mount, no EPERM).
+    print("kept host /proc (no remount)", file=sys.stderr, flush=True)
 
     # Open the slave PTY and attach to it as stdin/stdout/stderr +
     # controlling terminal.
     print(f"opening slave {slave_path}", file=sys.stderr, flush=True)
     slave = os.open(slave_path, os.O_RDWR)
     os.setsid()
-    # TIOCSCTTY = 0x540E — make slave our controlling tty.
-    import fcntl
+    # TIOCSCTTY = 0x540E — make slave our controlling tty. (fcntl imported at
+    # module scope; a local import here would shadow it for all of cmd_spawn.)
     fcntl.ioctl(slave, 0x540E, 0)
     print("about to dup slave over 0/1/2", file=sys.stderr, flush=True)
     os.dup2(slave, 0)
@@ -568,10 +634,7 @@ def cmd_restore(owner_uid: int, owner_gid: int, ckpt_dir: str,
     unshare(CLONE_NEWNS)
     make_root_rprivate()
     _prune_inherited_mounts()
-    subprocess.run(
-        ["mount", "-t", "proc", "-o", "nosuid,noexec,nodev", "proc", "/proc"],
-        check=True,
-    )
+    # No /proc remount — keep host /proc, matching the no-pidns dump.
 
     # First, peek at the checkpoint to discover the tty rdev/dev that was
     # recorded, so we can map fd[100] -> tty[that_id]. CRIU's "crit" tool
@@ -611,7 +674,16 @@ def cmd_restore(owner_uid: int, owner_gid: int, ckpt_dir: str,
         except pycriu.CRIUExceptionExternal as e:
             print(f"criu restore RPC failed: {e}", file=sys.stderr, flush=True)
             _emit_log_tail(ckpt_dir, "restore.log")
-            rc = 1
+            # PID collision (the original PID is occupied) -> exit 17 so the
+            # driver can start a fresh shell for this tab instead of treating it
+            # as a hard error. CRIU logs "Can't fork for <pid>: File exists".
+            collided = False
+            try:
+                with open(os.path.join(ckpt_dir, "restore.log")) as _lf:
+                    collided = "File exists" in _lf.read()
+            except OSError:
+                pass
+            rc = 17 if collided else 1
         else:
             # Hand the restored root PID back to the caller via the
             # rendezvous file. resp.pid is the host-namespace PID of
