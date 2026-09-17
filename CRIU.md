@@ -368,6 +368,21 @@ is off by default (see preferences) because the saved buffer belongs to
 a *different* process than the one freshly launched, which can be
 confusing.
 
+**A failed restore's checkpoint is preserved, not deleted.** Earlier,
+`_criu_feed_restart_banner`'s cleanup step unconditionally `rmtree`'d
+the checkpoint dir after any restart-fresh path — including a genuine
+in-session restore *failure*, destroying the only evidence of why it
+failed. It's now moved (not deleted) to
+`$XDG_DATA_HOME/terminator-criu/failed-restores/<uuid>-<timestamp>/`
+via `quarantine_failed_restore`, alongside a `reason.txt` capturing the
+same detail shown in the tab. The banner names the exact path. This
+directory isn't pruned automatically — it's meant for investigation,
+so clean it out by hand once you're done with an entry. The banner
+itself also now prints the *full* captured reason (every line of the
+CRIU stderr tail), not just its last line — the actually diagnostic
+line (a mount failure, a missing file, a PID collision) is usually in
+the middle of that tail, not its closing "Restoring FAILED."
+
 **Even the relaunch can fail** — the recorded command may no longer
 exist on this system (uninstalled tool, moved script, stale checkpoint
 from a system that has since changed). "Restore the tabs no matter

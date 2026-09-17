@@ -25,6 +25,7 @@ try:
     from .criu.client import checkpoint_dir_for_uuid as _criu_ckpt_dir_for_uuid
     from .criu.client import wipe_failed_checkpoint as _criu_wipe_failed
     from .criu.client import is_complete_checkpoint as _criu_is_complete
+    from .criu.client import quarantine_failed_restore as _criu_quarantine_failed_restore
     from .criu.client import SCROLLBACK_FILENAME as _CRIU_SCROLLBACK_FILENAME
     from .criu import session as _criu_session
     from .criu import inspect as _criu_inspect
@@ -38,6 +39,7 @@ except ImportError:
     _criu_wipe_failed = None
     _criu_session = None
     _criu_is_complete = None
+    _criu_quarantine_failed_restore = None
     _CRIU_SCROLLBACK_FILENAME = None
     _criu_client = None
     _criu_inspect = None
@@ -176,6 +178,12 @@ class Terminal(Gtk.VBox):
     # path to re-launch the same program. None for non-CRIU tabs.
     _criu_spawn_argv = None
     _criu_spawn_cwd = None
+
+    # Detailed error text from the most recent failed criu restore
+    # attempt on this tab (the actual CRIU stderr tail, not a generic
+    # summary). Consumed by _criu_feed_restart_banner as the reason
+    # shown to the user; None if no restore has failed this run.
+    _criu_last_restore_error = None
 
     # When the most recent CRIU dump for this tab failed AND the user
     # accepted close-anyway, this holds the metadata needed to restart
@@ -1870,7 +1878,13 @@ class Terminal(Gtk.VBox):
             '*** Terminator: previous CRIU checkpoint could not be used ***',
         ]
         if reason:
-            lines.append('    Reason: %s' % reason.splitlines()[-1])
+            # Show the full detail, not just the last line — the actual
+            # diagnostic content (a mount failure, a missing file, a PID
+            # collision) is usually in the middle of CRIU's log tail, not
+            # its closing "Restoring FAILED." line.
+            lines.append('    Reason:')
+            for reason_line in reason.splitlines():
+                lines.append('      %s' % reason_line)
         if self.config['restart_failed_checkpoint'] and argv:
             lines.append('    The original command line was re-launched:')
             lines.append('      %s' % argv_str)
@@ -1885,21 +1899,42 @@ class Terminal(Gtk.VBox):
         if not replay_scrollback:
             lines.append('    Scrollback from before is NOT being '
                          'replayed (see profile settings to opt in).')
+        # Step 3 (moved up so the banner can report where the failed
+        # checkpoint went): a genuine restore FAILURE gets its checkpoint
+        # preserved for investigation rather than deleted — quarantined
+        # to $XDG_DATA_HOME/terminator-criu/failed-restores/, alongside
+        # the captured reason, since that's exactly the evidence needed
+        # to diagnose it later. A `criu_restart` marker (the OTHER path
+        # that lands here — a dump that already failed at close time, or
+        # was already deliberately wiped) has nothing left at ckpt_dir to
+        # preserve; quarantine is then simply a no-op.
+        quarantine_path = None
+        if ckpt_dir and os.path.isdir(ckpt_dir):
+            if _criu_quarantine_failed_restore is not None:
+                quarantine_path = _criu_quarantine_failed_restore(
+                    ckpt_dir, self.uuid.hex, reason)
+            if quarantine_path is None:
+                # No quarantine function available, or it failed (e.g.
+                # filesystem error) — fall back to the old behavior
+                # rather than leaving a possibly-corrupt dir in the live
+                # checkpoints/ tree where a future restore might pick it
+                # up again.
+                try:
+                    import shutil as _sh
+                    _sh.rmtree(ckpt_dir, ignore_errors=True)
+                except Exception as e:
+                    err('CRIU: failed to wipe consumed restart dir %s: %s'
+                        % (ckpt_dir, e))
+        if quarantine_path:
+            lines.append('    The failed checkpoint was preserved for '
+                         'investigation at:')
+            lines.append('      %s' % quarantine_path)
         lines.append('')
         banner = '\r\n'.join(lines) + '\r\n'
         try:
             self.vte.feed(banner.encode('utf-8'))
         except Exception as e:
             err('CRIU: failed to feed restart banner: %s' % e)
-        # Step 3: consume the on-disk artifacts now. The tab is fresh
-        # and the next checkpoint (if any) will rebuild the dir.
-        if ckpt_dir and os.path.isdir(ckpt_dir):
-            try:
-                import shutil as _sh
-                _sh.rmtree(ckpt_dir, ignore_errors=True)
-            except Exception as e:
-                err('CRIU: failed to wipe consumed restart dir %s: %s'
-                    % (ckpt_dir, e))
 
     @staticmethod
     def _criu_read_proc_cmdline(pid):
@@ -2525,6 +2560,12 @@ class Terminal(Gtk.VBox):
                 err('CRIU restore cleanup: fresh PTY swap failed: %s'
                     % detach_err)
             os.close(master_fd)
+            # Keep the detailed reason around so the caller (spawn_child)
+            # can put it in the restart banner instead of a generic
+            # "restore failed" string — the actual CRIU error (mount
+            # failure, missing file, PID collision, etc.) is what the
+            # user actually needs to see.
+            self._criu_last_restore_error = str(e)
             self._feed_error(
                 'CRIU restore failed: %s\r\nSpawning a fresh tab instead.'
                 % e
@@ -2723,7 +2764,9 @@ class Terminal(Gtk.VBox):
                 pending_restart = {
                     'argv': fallback_argv,
                     'cwd': fallback_cwd or self.cwd,
-                    'reason': 'CRIU restore from saved checkpoint failed',
+                    'reason': (self._criu_last_restore_error
+                               or 'CRIU restore from saved checkpoint '
+                                  'failed (no further detail captured)'),
                 }
                 if (pending_restart['argv']
                         and self.config['restart_failed_checkpoint']):

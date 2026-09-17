@@ -134,6 +134,43 @@ def checkpoint_dir_for_uuid(uuid_hex):
     return os.path.join(base, "terminator-criu", "checkpoints", uuid_hex)
 
 
+def _criu_data_root():
+    base = os.environ.get("XDG_DATA_HOME") or \
+        os.path.expanduser("~/.local/share")
+    return os.path.join(base, "terminator-criu")
+
+
+def quarantine_failed_restore(ckpt_dir, uuid_hex, reason):
+    """A `criu restore` attempt against `ckpt_dir` failed. Preserve the
+    checkpoint for later investigation instead of deleting or
+    overwriting it: move it to
+    `$XDG_DATA_HOME/terminator-criu/failed-restores/<uuid>-<timestamp>/`
+    and drop the captured error text alongside it as `reason.txt`.
+
+    Moving (not copying) it out of `checkpoints/` also means the
+    original UUID slot is free — the tab starting fresh in its place
+    can take a new checkpoint of its own without colliding with the
+    quarantined one on disk.
+
+    Best-effort: swallows any OSError so a filesystem hiccup here never
+    blocks the tab from starting fresh. Returns the quarantine path on
+    success, None otherwise (including if ckpt_dir doesn't exist).
+    """
+    if not os.path.isdir(ckpt_dir):
+        return None
+    dest_root = os.path.join(_criu_data_root(), "failed-restores")
+    dest = os.path.join(
+        dest_root, "%s-%s" % (uuid_hex, time.strftime("%Y%m%dT%H%M%S")))
+    try:
+        os.makedirs(dest_root, exist_ok=True)
+        shutil.move(ckpt_dir, dest)
+        with open(os.path.join(dest, "reason.txt"), "w") as f:
+            f.write((reason or "(no reason captured)") + "\n")
+    except OSError:
+        return None
+    return dest
+
+
 # Marker the helper writes ONLY on a fully-successful dump. Its
 # presence in ckpt_dir means "this is a complete, restorable checkpoint";
 # absence means either a fresh dir or a failed-dump dir.
