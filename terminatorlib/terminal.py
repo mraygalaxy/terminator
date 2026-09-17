@@ -27,6 +27,7 @@ try:
     from .criu.client import is_complete_checkpoint as _criu_is_complete
     from .criu.client import SCROLLBACK_FILENAME as _CRIU_SCROLLBACK_FILENAME
     from .criu import session as _criu_session
+    from .criu import inspect as _criu_inspect
     _criu_client = _CriuClient()
 except ImportError:
     _CriuClient = None
@@ -39,6 +40,7 @@ except ImportError:
     _criu_is_complete = None
     _CRIU_SCROLLBACK_FILENAME = None
     _criu_client = None
+    _criu_inspect = None
 try:
     from urllib.parse import unquote as urlunquote
 except ImportError:
@@ -2678,6 +2680,8 @@ class Terminal(Gtk.VBox):
         # marker that means "no checkpoint to restore from".
         if self._criu_restore_requested and not pending_restart:
             self._criu_restore_requested = False  # one-shot
+            ckpt_dir = (_criu_ckpt_dir_for_uuid(self.uuid.hex)
+                        if _criu_ckpt_dir_for_uuid is not None else None)
             if self._restore_via_criu_helper():
                 self.command = shell
                 self.titlebar.update()
@@ -2686,9 +2690,34 @@ class Terminal(Gtk.VBox):
             # needing a restart-fresh path because the user-visible
             # state was lost. The banner feed below will explain.
             if pending_restart is None:
+                fallback_cwd = self._criu_spawn_cwd
+                fallback_argv = list(self._criu_spawn_argv or [])
+                # session.json didn't have this tab's spawn info (e.g.
+                # the session file was lost or this checkpoint dir is
+                # an orphan with no matching entry) but a checkpoint
+                # dir still exists. CRIU's own dump images already
+                # record the process's cwd and executable — recover
+                # what we can directly from there rather than dropping
+                # straight to the profile's bare default shell in
+                # $HOME. Best-effort: never raises, returns None on any
+                # failure.
+                if not fallback_cwd and _criu_inspect is not None and ckpt_dir:
+                    fallback_cwd = _criu_inspect.recover_cwd(ckpt_dir)
+                    if fallback_cwd:
+                        dbg('CRIU: recovered cwd from dump images: %s'
+                            % fallback_cwd)
+                if not fallback_argv and _criu_inspect is not None and ckpt_dir:
+                    recovered_exe = _criu_inspect.recover_exe(ckpt_dir)
+                    # Only worth relaunching explicitly if it's not
+                    # just the tab's own default shell — that's already
+                    # what happens with an empty argv.
+                    if recovered_exe and recovered_exe != shell:
+                        fallback_argv = [recovered_exe]
+                        dbg('CRIU: recovered executable from dump images: %s'
+                            % recovered_exe)
                 pending_restart = {
-                    'argv': list(self._criu_spawn_argv or []),
-                    'cwd': self._criu_spawn_cwd or self.cwd,
+                    'argv': fallback_argv,
+                    'cwd': fallback_cwd or self.cwd,
                     'reason': 'CRIU restore from saved checkpoint failed',
                 }
                 if (pending_restart['argv']
@@ -2697,6 +2726,12 @@ class Terminal(Gtk.VBox):
                     args = [shell] + list(pending_restart['argv'])
                     if pending_restart['cwd']:
                         self.set_cwd(pending_restart['cwd'])
+                elif pending_restart['cwd']:
+                    # No argv to relaunch (or the fallback found nothing
+                    # more specific than the default shell) — still
+                    # land the fresh shell in the recovered directory
+                    # rather than $HOME.
+                    self.set_cwd(pending_restart['cwd'])
 
         # CRIU checkpoint-capable spawn path.
         # If this tab is opted in (profile default or per-tab toggle)

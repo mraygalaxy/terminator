@@ -150,19 +150,47 @@ if __name__ == '__main__':
             if criu_session_layout is not None:
                 dbg('Loading CRIU session in place of default layout')
                 TERMINATOR.create_layout(OPTIONS.layout, layout=criu_session_layout)
-                # Session is one-shot — having processed it, clear so the
-                # next launch starts clean unless the user checkpoints
-                # again or closes-with-tabs (which would re-write it).
-                # Also sweep any checkpoint dirs not referenced by the
-                # session we just loaded — those are orphans from a
-                # crash or weird shutdown and would otherwise sit on
-                # disk forever.
-                try:
-                    keep = _criu_sess.referenced_uuids(criu_session_layout)
-                    _criu_sess.remove_orphan_checkpoints(keep)
-                    _criu_sess.clear()
-                except Exception as _e:
-                    err('CRIU session cleanup failed: %s' % _e)
+                # IMPORTANT: create_layout() only builds the window/tab
+                # widget hierarchy — it does NOT spawn or restore
+                # anything yet. spawn_child() explicitly no-ops while
+                # doing_layout is True (see terminal.py), and that flag
+                # only flips once TERMINATOR.layout_done() runs, below.
+                # Actual CRIU restore attempts happen later still, once
+                # Gtk's main loop starts processing the realize signals
+                # that trigger each tab's spawn_child().
+                #
+                # session.json is therefore deliberately NOT cleared
+                # here. Clearing now — before any tab has actually
+                # attempted its restore — would delete the only record
+                # of each tab's command line, cwd, and checkpoint
+                # reference based purely on the layout having been
+                # drawn, not on anything having actually succeeded. If
+                # something goes wrong during the real spawn/restore
+                # phase (a crash, a wedged helper, anything), that
+                # information would already be gone and unrecoverable —
+                # which is exactly what happened before this fix: a
+                # crash during restore destroyed session.json before a
+                # single tab had finished spawning.
+                #
+                # Instead, schedule the sweep-and-clear at LOW idle
+                # priority so it runs only after the normal-priority
+                # realize-signal callbacks (which is where spawn_child()
+                # actually runs for every tab) have already had their
+                # turn in this pass of the main loop. By then each tab
+                # has either succeeded or hit its own Python-level
+                # fallback (restart-fresh with saved argv/cwd) — a
+                # crash from here on is a new, unrelated failure, not
+                # this one throwing away recovery data prematurely.
+                def _consume_criu_session():
+                    try:
+                        keep = _criu_sess.referenced_uuids(criu_session_layout)
+                        _criu_sess.remove_orphan_checkpoints(keep)
+                        _criu_sess.clear()
+                    except Exception as _e:
+                        err('CRIU session cleanup failed: %s' % _e)
+                    return False  # one-shot
+                GLib.idle_add(_consume_criu_session,
+                               priority=GLib.PRIORITY_LOW)
             else:
                 TERMINATOR.create_layout(OPTIONS.layout)
             # Wire up the logind PrepareForShutdown / PrepareForSleep

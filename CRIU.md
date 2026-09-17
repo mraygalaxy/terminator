@@ -385,6 +385,47 @@ restart-fresh path above for that tab alone, while sibling tabs
 continue their own spawn/restore normally. A bug here previously broke
 this isolation at the process level, not the Python level — see below.
 
+**session.json used to be deleted before any tab had actually
+restored (fixed).** The top-level `terminator` launcher script loaded
+`session.json`, handed it to `create_layout()` to build the window/tab
+widget tree, and then immediately deleted the session file and swept
+orphan checkpoint dirs — all before `layout_done()` had even run.
+`create_layout()` only builds widgets; it does not spawn or restore
+anything (`spawn_child()` explicitly no-ops while `doing_layout` is
+`True`, and that flag isn't cleared until `layout_done()`). So the
+session file was being deleted purely because the layout had been
+*drawn*, not because any tab had actually finished restoring or
+falling back successfully. If something went wrong during the real
+spawn/restore phase — which only happens later, once Gtk's main loop
+starts processing widget-realize signals — the recovery data was
+already gone with no way back. The fix defers the sweep-and-clear to a
+`GLib.idle_add` callback at `PRIORITY_LOW`, so it only runs after the
+normal-priority realize callbacks (where every tab's `spawn_child()`
+actually executes) have already had their turn.
+
+**Recovering cwd/command when session.json itself is missing or
+incomplete.** Even with the above fix, a checkpoint dir can still
+outlive its session entry — an older orphaned dump, or a session file
+lost some other way. `terminatorlib/criu/inspect.py` provides a
+last-resort fallback for exactly this: it decodes the checkpoint's own
+CRIU images via `crit` (installed alongside `criu`) to read the
+process's actual working directory (`fs-<pid>.img` + `files.img`) and
+executable path (`mm-<pid>.img`'s `exe_file_id` + `files.img`) straight
+out of the dump, with no dependency on session.json at all. The
+restart-fresh fallback in `spawn_child` calls into this only when
+`criu_spawn_cwd`/`criu_spawn_argv` weren't available from the loaded
+layout, so a tab still lands in the right directory (and relaunches
+the right program, if it wasn't just the tab's own shell) even when
+the session metadata that would normally supply that is gone. Every
+function in this module is best-effort and returns `None` on any
+failure (missing `crit`, corrupt images, format changes) rather than
+raising — it's a fallback bolted onto an already-degraded path and
+must never become a new way to crash or block startup. It does not
+recover the literal original argv of an idle shell (CRIU doesn't store
+that anywhere convenient — it lives in the process's own dumped
+memory), so a plain shell tab still comes back as a plain shell, just
+in the correct directory instead of `$HOME`.
+
 **Cross-tab crash on restore failure (fixed).** The cleanup path after
 a failed `criu restore` used to call `self.vte.set_pty(None)` on the
 foreign PTY it had allocated. VTE 0.76 segfaults natively when
