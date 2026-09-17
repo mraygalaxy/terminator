@@ -368,6 +368,16 @@ is off by default (see preferences) because the saved buffer belongs to
 a *different* process than the one freshly launched, which can be
 confusing.
 
+**Even the relaunch can fail** — the recorded command may no longer
+exist on this system (uninstalled tool, moved script, stale checkpoint
+from a system that has since changed). "Restore the tabs no matter
+what" is the design goal here: if `Vte.Terminal.spawn_sync` on the
+recovered argv also fails, `spawn_child` retries once more with the
+profile's own default shell and feeds a message naming exactly what
+was supposed to be running, so the tab always ends up alive and usable
+— worst case, a plain shell with a clear note of what to re-run by
+hand, never a dead tab.
+
 **Restore-time failures.** If `criu restore` itself raises (Python-
 detectable failure, distinct from "alive but wedged" — see limitations
 below), the tab's `pending_restart` is synthesized from the saved
@@ -390,18 +400,17 @@ restored (fixed).** The top-level `terminator` launcher script loaded
 `session.json`, handed it to `create_layout()` to build the window/tab
 widget tree, and then immediately deleted the session file and swept
 orphan checkpoint dirs — all before `layout_done()` had even run.
-`create_layout()` only builds widgets; it does not spawn or restore
-anything (`spawn_child()` explicitly no-ops while `doing_layout` is
-`True`, and that flag isn't cleared until `layout_done()`). So the
-session file was being deleted purely because the layout had been
-*drawn*, not because any tab had actually finished restoring or
-falling back successfully. If something went wrong during the real
-spawn/restore phase — which only happens later, once Gtk's main loop
-starts processing widget-realize signals — the recovery data was
-already gone with no way back. The fix defers the sweep-and-clear to a
-`GLib.idle_add` callback at `PRIORITY_LOW`, so it only runs after the
-normal-priority realize callbacks (where every tab's `spawn_child()`
-actually executes) have already had their turn.
+`create_layout()` only builds widgets; the actual spawn/restore
+attempts happen synchronously inside `layout_done()` itself, which
+loops over every terminal and calls `spawn_child()` directly
+(`spawn_child()` no-ops while `doing_layout` is `True`, and that flag
+is only cleared at the top of `layout_done()`). So the session file was
+being deleted purely because the layout had been *drawn*, not because
+any tab had actually finished restoring or falling back successfully.
+The fix moves the sweep-and-clear to run only after `TERMINATOR.layout_
+done()` returns — by construction, not by exception handling: if
+`layout_done()` never returns (a repeat of the crash below), the
+cleanup code is simply never reached and session.json survives.
 
 **Recovering cwd/command when session.json itself is missing or
 incomplete.** Even with the above fix, a checkpoint dir can still
@@ -468,7 +477,7 @@ disabled when their parent is off.
 | Setting | Default | Description |
 |---|---|---|
 | Enable checkpoint/restore (CRIU) for tabs in this profile | Off | Master switch. Without it, none of the rows below take effect. |
-| Restart the original program if checkpoint or restore fails | On | Fall back to relaunching the original argv (with shell wrap) instead of dropping to the profile's default shell. |
+| Re-run last command on CRIU failure | On | Fall back to relaunching the original argv (with shell wrap) instead of dropping to the profile's default shell. When off, the tab stays at the default shell and prints what was originally running so you can re-run it yourself. |
 | Restore scrollback history on checkpoint restore | On | Replay the captured VTE buffer when a CRIU restore succeeds. |
 | Also replay scrollback when restarting after a failed checkpoint | Off | Replay scrollback on the *restart-fresh* path. Gated on the row above — scrollback belongs to a different process than the one being relaunched. |
 | Always close anyway when checkpoints fail (skip the confirmation dialog) | Off | Auto-set by the dialog's Remember checkbox; surfaced here so the user can re-enable the prompt. |

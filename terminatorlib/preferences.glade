@@ -2217,12 +2217,12 @@
                         </child>
                         <child>
                           <object class="GtkCheckButton" id="restart_failed_checkpoint_checkbutton">
-                            <property name="label" translatable="yes">_Restart the original program if checkpoint or restore fails</property>
+                            <property name="label" translatable="yes">_Re-run last command on CRIU failure</property>
                             <property name="use-action-appearance">False</property>
                             <property name="visible">True</property>
                             <property name="can-focus">True</property>
                             <property name="receives-default">False</property>
-                            <property name="tooltip-text" translatable="yes">When a tab's checkpoint cannot be created (e.g. the program uses io_uring or other state CRIU cannot snapshot) or its restore fails on next launch, fall back to launching the original command line fresh, instead of dropping back to the profile's default shell. The program loses its state but the tab keeps doing what you originally asked it to do.</property>
+                            <property name="tooltip-text" translatable="yes">When a tab's checkpoint cannot be created (e.g. the program uses io_uring or other state CRIU cannot snapshot) or its restore fails on next launch, re-run the original command line fresh, instead of dropping back to the profile's default shell. The program loses its state but the tab keeps doing what you originally asked it to do. When off, the tab explains what was originally running and why it wasn't re-run, so you can start it yourself.</property>
                             <property name="use-underline">True</property>
                             <property name="xalign">0</property>
                             <property name="draw-indicator">True</property>

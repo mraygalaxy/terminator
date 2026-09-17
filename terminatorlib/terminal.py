@@ -1863,7 +1863,8 @@ class Terminal(Gtk.VBox):
         # any scrollback above and the program's first output below.
         reason = (pending_restart.get('reason') or '').strip()
         argv = pending_restart.get('argv') or []
-        argv_str = ' '.join(argv) if argv else '(no recorded argv)'
+        argv_str = ' '.join(argv) if argv else \
+            'unknown — no command line could be recovered'
         lines = [
             '',
             '*** Terminator: previous CRIU checkpoint could not be used ***',
@@ -1874,9 +1875,13 @@ class Terminal(Gtk.VBox):
             lines.append('    The original command line was re-launched:')
             lines.append('      %s' % argv_str)
         elif not self.config['restart_failed_checkpoint']:
-            lines.append('    Per profile setting, the tab was dropped '
-                         'to the default shell instead of re-launching '
-                         '"%s".' % argv_str)
+            lines.append(
+                '    "Re-run last command on CRIU failure" is OFF for '
+                'this profile, so the tab was left at the default shell.')
+            lines.append('    What was originally running here:')
+            lines.append('      %s' % argv_str)
+            lines.append('    Re-run it yourself, or turn the setting on '
+                         'in Preferences -> Profile -> Command.')
         if not replay_scrollback:
             lines.append('    Scrollback from before is NOT being '
                          'replayed (see profile settings to opt in).')
@@ -2782,7 +2787,45 @@ class Terminal(Gtk.VBox):
 
         self.titlebar.update()
 
-        if self.pid == -1:
+        if self.pid == -1 and pending_restart is not None:
+            # "Restore the tabs no matter what": the recorded command
+            # (from session.json, or best-effort recovered straight from
+            # a checkpoint's own dump images) doesn't exist on this
+            # system anymore, or otherwise failed to launch. Don't leave
+            # the tab dead — retry with the profile's own default shell
+            # so the user gets a working tab, and say plainly what was
+            # supposed to be there so they can re-run it by hand.
+            failed_argv_str = ' '.join(pending_restart.get('argv') or []) \
+                or shell
+            fallback_shell = util.shell_lookup()
+            fallback_args = [fallback_shell]
+            result, self.pid = self.vte.spawn_sync(
+                Vte.PtyFlags.DEFAULT,
+                self.cwd,
+                fallback_args,
+                envv,
+                GLib.SpawnFlags.FILE_AND_ARGV_ZERO,
+                None,
+                None,
+                None
+            )
+            self.command = fallback_shell
+            self.titlebar.update()
+            if self.pid == -1:
+                # Even the plain default shell couldn't start — this is
+                # a deeper system problem, nothing left to fall back to.
+                self.vte.feed(_('Unable to start shell:') + fallback_shell)
+                return -1
+            self.vte.feed((
+                '\r\n*** Terminator: could not re-run the original command ***\r\n'
+                '    %s\r\n'
+                '    A plain shell was started instead — you will need '
+                'to re-run this yourself.\r\n\r\n' % failed_argv_str
+            ).encode('utf-8'))
+            # Already explained above — the generic restart banner below
+            # would contradict this (it assumes the argv WAS relaunched).
+            return
+        elif self.pid == -1:
             self.vte.feed(_('Unable to start shell:') + shell)
             return -1
 
