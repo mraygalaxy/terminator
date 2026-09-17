@@ -134,41 +134,74 @@ def checkpoint_dir_for_uuid(uuid_hex):
     return os.path.join(base, "terminator-criu", "checkpoints", uuid_hex)
 
 
-def _criu_data_root():
-    base = os.environ.get("XDG_DATA_HOME") or \
-        os.path.expanduser("~/.local/share")
-    return os.path.join(base, "terminator-criu")
+
+# Subdirectory (of a tab's OWN checkpoint dir) holding the most recent
+# quarantined failed-restore snapshot, if any. Nested under the same
+# uuid-keyed dir — not a separate global archive — so it travels with
+# the tab's own identity and lifecycle: an intentional tab close
+# (criu.session.drop(), which rmtree's the whole checkpoint_dir_for_
+# uuid(uuid_hex)) sweeps it away for free, with no separate cleanup
+# code needed. Bounded to exactly one snapshot per tab: a later
+# failure replaces it rather than accumulating.
+FAILED_RESTORE_DIRNAME = "failed"
 
 
-def quarantine_failed_restore(ckpt_dir, uuid_hex, reason):
-    """A `criu restore` attempt against `ckpt_dir` failed. Preserve the
-    checkpoint for later investigation instead of deleting or
-    overwriting it: move it to
-    `$XDG_DATA_HOME/terminator-criu/failed-restores/<uuid>-<timestamp>/`
-    and drop the captured error text alongside it as `reason.txt`.
+def quarantine_failed_restore(ckpt_dir, reason):
+    """A `criu restore` attempt against `ckpt_dir` (a tab's own
+    checkpoint directory) failed. Preserve it for later investigation
+    by moving its current contents into a `failed/` subdirectory of
+    that SAME ckpt_dir, with the captured error text alongside as
+    `reason.txt`, instead of deleting it.
 
-    Moving (not copying) it out of `checkpoints/` also means the
-    original UUID slot is free — the tab starting fresh in its place
-    can take a new checkpoint of its own without colliding with the
-    quarantined one on disk.
+    Replaces any PREVIOUS `failed/` snapshot for this tab — e.g. the
+    tab restarted fresh, was checkpointed again later, and THAT
+    checkpoint also failed to restore on a subsequent crash. Only the
+    most recent failure is kept per tab, so this never grows without
+    bound the way a separate timestamped archive would.
+
+    Leaves ckpt_dir itself present (containing only `failed/` and
+    nothing else) rather than removing it outright, so
+    is_complete_checkpoint(ckpt_dir) correctly reports "not
+    restorable" at the top level (nothing left to accidentally
+    re-attempt) while the quarantined dump remains reachable at
+    failed_restore_dir_for_uuid().
 
     Best-effort: swallows any OSError so a filesystem hiccup here never
-    blocks the tab from starting fresh. Returns the quarantine path on
-    success, None otherwise (including if ckpt_dir doesn't exist).
+    blocks the tab from starting fresh. Returns the failed/ path on
+    success, None otherwise (including if ckpt_dir doesn't exist or
+    has nothing to quarantine).
     """
     if not os.path.isdir(ckpt_dir):
         return None
-    dest_root = os.path.join(_criu_data_root(), "failed-restores")
-    dest = os.path.join(
-        dest_root, "%s-%s" % (uuid_hex, time.strftime("%Y%m%dT%H%M%S")))
+    failed_dir = os.path.join(ckpt_dir, FAILED_RESTORE_DIRNAME)
     try:
-        os.makedirs(dest_root, exist_ok=True)
-        shutil.move(ckpt_dir, dest)
-        with open(os.path.join(dest, "reason.txt"), "w") as f:
+        entries = [n for n in os.listdir(ckpt_dir)
+                   if n != FAILED_RESTORE_DIRNAME]
+    except OSError:
+        return None
+    if not entries:
+        return None  # nothing at the top level to quarantine
+    if os.path.isdir(failed_dir):
+        shutil.rmtree(failed_dir, ignore_errors=True)
+    try:
+        os.makedirs(failed_dir, exist_ok=True)
+        for name in entries:
+            shutil.move(os.path.join(ckpt_dir, name),
+                        os.path.join(failed_dir, name))
+        with open(os.path.join(failed_dir, "reason.txt"), "w") as f:
             f.write((reason or "(no reason captured)") + "\n")
     except OSError:
         return None
-    return dest
+    return failed_dir
+
+
+def failed_restore_dir_for_uuid(uuid_hex):
+    """Path to a tab's quarantined failed-restore snapshot, if it has
+    one. None if there isn't one (never failed, or the tab/checkpoint
+    was cleaned up since)."""
+    d = os.path.join(checkpoint_dir_for_uuid(uuid_hex),
+                      FAILED_RESTORE_DIRNAME)
+    return d if os.path.isdir(d) else None
 
 
 # Marker the helper writes ONLY on a fully-successful dump. Its

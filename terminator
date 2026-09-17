@@ -213,7 +213,15 @@ if __name__ == '__main__':
         # unless the user checkpoints again or closes with tabs open.
         if consume_criu_session_after_layout:
             try:
-                keep = _criu_sess.referenced_uuids(criu_session_layout)
+                # Keep every tab present in the session, not just the
+                # ones currently flagged criu_restore=True. A tab whose
+                # last restore attempt failed has criu_restore=False in
+                # THIS run's freshly re-saved layout even though its
+                # checkpoint dir still holds a quarantined failed/
+                # snapshot (see quarantine_failed_restore) that must
+                # survive until the tab is actually closed -- not just
+                # until it's no longer restorable.
+                keep = _criu_sess.all_uuids(criu_session_layout)
                 _criu_sess.remove_orphan_checkpoints(keep)
                 _criu_sess.clear()
             except Exception as _e:

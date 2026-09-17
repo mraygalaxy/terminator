@@ -111,6 +111,29 @@ def referenced_uuids(layout):
     return out
 
 
+def all_uuids(layout):
+    """Extract every tab UUID present in a layout dict, regardless of
+    criu_restore status. Used as the orphan-sweep keep-set (see
+    remove_orphan_checkpoints): a tab that's part of the current
+    session is not an orphan just because it isn't currently flagged
+    restorable — most commonly, right after a restore FAILURE, when
+    its checkpoint dir holds nothing but a quarantined failed/
+    snapshot (see terminatorlib.criu.client.quarantine_failed_restore)
+    that must survive until the tab is actually closed, not merely
+    until the next session-consume pass."""
+    out = set()
+    if not isinstance(layout, dict):
+        return out
+    for entry in layout.values():
+        if not isinstance(entry, dict):
+            continue
+        u = entry.get("uuid", "")
+        if not u:
+            continue
+        out.add(str(u).replace("-", "").lower())
+    return out
+
+
 def remove_orphan_checkpoints(keep_uuids):
     """Delete checkpoint dirs whose UUID is NOT in `keep_uuids`.
 

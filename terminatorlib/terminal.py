@@ -26,6 +26,8 @@ try:
     from .criu.client import wipe_failed_checkpoint as _criu_wipe_failed
     from .criu.client import is_complete_checkpoint as _criu_is_complete
     from .criu.client import quarantine_failed_restore as _criu_quarantine_failed_restore
+    from .criu.client import failed_restore_dir_for_uuid as _criu_failed_restore_dir_for_uuid
+    from .criu.client import FAILED_RESTORE_DIRNAME as _CRIU_FAILED_RESTORE_DIRNAME
     from .criu.client import SCROLLBACK_FILENAME as _CRIU_SCROLLBACK_FILENAME
     from .criu import session as _criu_session
     from .criu import inspect as _criu_inspect
@@ -40,6 +42,8 @@ except ImportError:
     _criu_session = None
     _criu_is_complete = None
     _criu_quarantine_failed_restore = None
+    _criu_failed_restore_dir_for_uuid = None
+    _CRIU_FAILED_RESTORE_DIRNAME = "failed"
     _CRIU_SCROLLBACK_FILENAME = None
     _criu_client = None
     _criu_inspect = None
@@ -1902,29 +1906,23 @@ class Terminal(Gtk.VBox):
         # Step 3 (moved up so the banner can report where the failed
         # checkpoint went): a genuine restore FAILURE gets its checkpoint
         # preserved for investigation rather than deleted — quarantined
-        # to $XDG_DATA_HOME/terminator-criu/failed-restores/, alongside
-        # the captured reason, since that's exactly the evidence needed
-        # to diagnose it later. A `criu_restart` marker (the OTHER path
-        # that lands here — a dump that already failed at close time, or
-        # was already deliberately wiped) has nothing left at ckpt_dir to
-        # preserve; quarantine is then simply a no-op.
+        # into a `failed/` subdir of this SAME tab's checkpoint dir
+        # (travels with the tab's identity; swept automatically by an
+        # intentional close, replaced by any later failure — see
+        # quarantine_failed_restore's docstring), alongside the captured
+        # reason. A `criu_restart` marker (the OTHER path that lands
+        # here — a dump that already failed at close time, or was
+        # already deliberately wiped) has nothing left at ckpt_dir to
+        # preserve; quarantine is then simply a no-op, and we leave
+        # whatever is on disk alone rather than guessing at cleanup —
+        # deleting here risks destroying an already-quarantined `failed/`
+        # from an EARLIER failure that legitimately has nothing new to
+        # replace it with yet.
         quarantine_path = None
-        if ckpt_dir and os.path.isdir(ckpt_dir):
-            if _criu_quarantine_failed_restore is not None:
-                quarantine_path = _criu_quarantine_failed_restore(
-                    ckpt_dir, self.uuid.hex, reason)
-            if quarantine_path is None:
-                # No quarantine function available, or it failed (e.g.
-                # filesystem error) — fall back to the old behavior
-                # rather than leaving a possibly-corrupt dir in the live
-                # checkpoints/ tree where a future restore might pick it
-                # up again.
-                try:
-                    import shutil as _sh
-                    _sh.rmtree(ckpt_dir, ignore_errors=True)
-                except Exception as e:
-                    err('CRIU: failed to wipe consumed restart dir %s: %s'
-                        % (ckpt_dir, e))
+        if (ckpt_dir and os.path.isdir(ckpt_dir)
+                and _criu_quarantine_failed_restore is not None):
+            quarantine_path = _criu_quarantine_failed_restore(
+                ckpt_dir, reason)
         if quarantine_path:
             lines.append('    The failed checkpoint was preserved for '
                          'investigation at:')
@@ -2154,11 +2152,27 @@ class Terminal(Gtk.VBox):
         ckpt_dir = _criu_ckpt_dir_for_uuid(self.uuid.hex)
         # CRIU dumps additive into the target dir — a re-dump on top of
         # an older dump leaves a mix of files from both. Wipe first so
-        # the dir always reflects the latest snapshot.
+        # the dir always reflects the latest snapshot — EXCEPT a
+        # quarantined failed/ subdir from an earlier restore failure on
+        # this same tab, which must survive an ordinary re-checkpoint
+        # (sleep, screen-lock, window close). It only gets cleared by
+        # quarantine_failed_restore() itself replacing it after a LATER
+        # failure, or by the tab's own checkpoint dir being removed
+        # entirely on an intentional close.
         if os.path.isdir(ckpt_dir):
             try:
-                import shutil as _sh
-                _sh.rmtree(ckpt_dir, ignore_errors=True)
+                for name in os.listdir(ckpt_dir):
+                    if name == _CRIU_FAILED_RESTORE_DIRNAME:
+                        continue
+                    victim = os.path.join(ckpt_dir, name)
+                    try:
+                        if os.path.isdir(victim) and not os.path.islink(victim):
+                            import shutil as _sh
+                            _sh.rmtree(victim, ignore_errors=True)
+                        else:
+                            os.unlink(victim)
+                    except OSError:
+                        pass
             except Exception as e:
                 err('Could not clear stale checkpoint dir before '
                     're-dump (%s): %s' % (ckpt_dir, e))

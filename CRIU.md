@@ -271,6 +271,7 @@ starts with a clean screen on top of the underlying process state.
 | CRIU dump images per tab (persistent across reboots) | `$XDG_DATA_HOME/terminator-criu/checkpoints/<tab-uuid>/` |
 | Saved VTE buffer for each checkpoint | `$XDG_DATA_HOME/terminator-criu/checkpoints/<tab-uuid>/scrollback.txt` |
 | Marker that a dump completed cleanly (presence = restorable) | `$XDG_DATA_HOME/terminator-criu/checkpoints/<tab-uuid>/tty_meta.json` |
+| Quarantined snapshot of a checkpoint whose restore failed (one per tab, replaced by a later failure, removed on intentional close) | `$XDG_DATA_HOME/terminator-criu/checkpoints/<tab-uuid>/failed/`, with `.../failed/reason.txt` alongside |
 | Auto-saved session (hidden, one-shot, consumed on next launch) | `$XDG_DATA_HOME/terminator-criu/session.json` |
 | Helper diagnostic log, transient state | `$XDG_STATE_HOME/terminator-criu/helper.log` |
 
@@ -368,20 +369,50 @@ is off by default (see preferences) because the saved buffer belongs to
 a *different* process than the one freshly launched, which can be
 confusing.
 
-**A failed restore's checkpoint is preserved, not deleted.** Earlier,
+**A failed restore's checkpoint is preserved, not deleted — and stays
+tied to the tab, not a separate growing archive.** Earlier,
 `_criu_feed_restart_banner`'s cleanup step unconditionally `rmtree`'d
 the checkpoint dir after any restart-fresh path — including a genuine
 in-session restore *failure*, destroying the only evidence of why it
-failed. It's now moved (not deleted) to
-`$XDG_DATA_HOME/terminator-criu/failed-restores/<uuid>-<timestamp>/`
-via `quarantine_failed_restore`, alongside a `reason.txt` capturing the
-same detail shown in the tab. The banner names the exact path. This
-directory isn't pruned automatically — it's meant for investigation,
-so clean it out by hand once you're done with an entry. The banner
-itself also now prints the *full* captured reason (every line of the
-CRIU stderr tail), not just its last line — the actually diagnostic
-line (a mount failure, a missing file, a PID collision) is usually in
-the middle of that tail, not its closing "Restoring FAILED."
+failed. `quarantine_failed_restore` (in `terminatorlib/criu/client.py`)
+now moves the failed dump into a `failed/` subdirectory of that SAME
+tab's own checkpoint dir (`checkpoints/<uuid>/failed/`), with a
+`reason.txt` capturing the same detail shown in the tab, instead of
+deleting it. Nesting it under the tab's own uuid — rather than a
+separate timestamped archive — gives it the tab's own lifecycle for
+free:
+
+- **Bounded, not ever-growing.** Only one `failed/` snapshot is kept
+  per tab. If the tab restarts fresh, gets checkpointed again later,
+  and *that* checkpoint also fails to restore on a subsequent crash,
+  the new failure replaces the old `failed/` rather than accumulating
+  a history.
+- **An ordinary re-checkpoint doesn't wipe it.** The pre-dump wipe in
+  `_criu_auto_checkpoint` (which clears the dir before each fresh dump,
+  since CRIU writes additively) explicitly skips `failed/` — a sleep,
+  screen-lock, or window-close checkpoint of the *new* fallback process
+  coexists with the still-quarantined evidence from the old failure.
+- **An intentional tab close sweeps it away for free.** `criu.session.
+  drop()` (Ctrl-D, the popup-menu close, etc.) already `rmtree`s the
+  tab's whole `checkpoints/<uuid>/` dir — `failed/` goes with it, no
+  separate cleanup code needed. This is exactly the lifecycle rule
+  requested: analysis data survives resume attempts, but a normal
+  close means "I'm done with this tab," evidence included.
+- **The orphan-sweep at startup won't delete it either.** That sweep
+  used to keep only uuids flagged `criu_restore=True` in the loaded
+  session — which a tab that just failed its restore no longer is.
+  `terminatorlib/criu/session.all_uuids()` is the fix: the orphan-sweep
+  keep-set is now every tab uuid present in the session, restorable or
+  not, so a tab that's still part of the current arrangement is never
+  treated as an orphan just because its last restore failed.
+
+`failed_restore_dir_for_uuid(uuid_hex)` looks up a tab's quarantined
+snapshot, if it has one. The banner names the exact path so the user
+can go inspect it by hand. The banner itself also now prints the
+*full* captured reason (every line of the CRIU stderr tail), not just
+its last line — the actually diagnostic line (a mount failure, a
+missing file, a PID collision) is usually in the middle of that tail,
+not its closing "Restoring FAILED."
 
 **Even the relaunch can fail** — the recorded command may no longer
 exist on this system (uninstalled tool, moved script, stale checkpoint
