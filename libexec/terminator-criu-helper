@@ -177,6 +177,22 @@ _PRUNE_BY_PREFIX_AND_TYPE = (
     ("/run/user/", "fuse."),
 )
 
+# Docker overlay2 driver self-test mount (the "opaque bug" check
+# dockerd runs at daemon startup). It mounts a throwaway overlay under
+# a freshly-random directory name, checks kernel behavior, then
+# unmounts AND deletes the backing directories — all within
+# milliseconds. If a tab's namespace happens to be created at that
+# exact moment, `unshare(CLONE_NEWNS)` inherits it like any other host
+# mount, and it gets baked into every future `criu dump` for that tab.
+# By restore time (even seconds later, let alone across a reboot) the
+# backing directories are long gone, so `criu restore` fails trying to
+# recreate the overlay: "Unable to mount overlay ... No such file or
+# directory". Matched by (parent dir, basename prefix) since the
+# random suffix is different every dockerd start.
+_PRUNE_BY_PARENT_AND_BASENAME_PREFIX = (
+    ("/var/lib/docker/overlay2/", "opaque-bug-check"),
+)
+
 
 def _enumerate_mounts() -> list[tuple[str, str]]:
     """Read /proc/self/mountinfo and return (mountpoint, fstype)
@@ -206,31 +222,49 @@ def _enumerate_mounts() -> list[tuple[str, str]]:
     return mounts
 
 
-def _prune_inherited_mounts() -> None:
-    """Lazy-unmount every inherited mount that breaks CRIU.
+def _should_prune(mp: str, fstype: str) -> bool:
+    """Pure predicate: should this (mountpoint, fstype) pair be pruned?
 
-    Two filter rules apply:
+    Three filter rules apply:
       1. Mountpoint matches one of `_PRUNE_PREFIXES` (or is a child).
       2. Mountpoint is under one of `_PRUNE_BY_PREFIX_AND_TYPE`'s path
          prefixes AND its fstype starts with the configured fstype
          prefix (e.g. fuse mounts under /run/user/).
+      3. Mountpoint's immediate parent matches one of
+         `_PRUNE_BY_PARENT_AND_BASENAME_PREFIX`'s path prefixes AND its
+         basename starts with the configured prefix (e.g. dockerd's
+         opaque-bug-check self-test mounts under /var/lib/docker/overlay2/).
 
-    Uses umount2(MNT_DETACH) directly via libc rather than forking the
-    umount(8) binary — both for speed and to avoid subprocess-related
-    flakiness when we've already started disturbing the mount tree.
+    Split out from `_prune_inherited_mounts` so it can be unit tested
+    without root, a mount namespace, or CRIU installed.
+    """
+    if mp == "/":
+        return False
+    if any(mp == p or mp.startswith(p + "/") for p in _PRUNE_PREFIXES):
+        return True
+    for path_prefix, type_prefix in _PRUNE_BY_PREFIX_AND_TYPE:
+        if mp.startswith(path_prefix) and fstype.startswith(type_prefix):
+            return True
+    for parent, basename_prefix in _PRUNE_BY_PARENT_AND_BASENAME_PREFIX:
+        if not mp.startswith(parent):
+            continue
+        remainder = mp[len(parent):]
+        basename = remainder.split("/", 1)[0]
+        if basename.startswith(basename_prefix):
+            return True
+    return False
+
+
+def _prune_inherited_mounts() -> None:
+    """Lazy-unmount every inherited mount that breaks CRIU.
+
+    See `_should_prune` for the filter rules. Uses umount2(MNT_DETACH)
+    directly via libc rather than forking the umount(8) binary — both
+    for speed and to avoid subprocess-related flakiness when we've
+    already started disturbing the mount tree.
     """
     for mp, fstype in _enumerate_mounts():
-        if mp == "/":
-            continue
-        prune = False
-        if any(mp == p or mp.startswith(p + "/") for p in _PRUNE_PREFIXES):
-            prune = True
-        else:
-            for path_prefix, type_prefix in _PRUNE_BY_PREFIX_AND_TYPE:
-                if mp.startswith(path_prefix) and fstype.startswith(type_prefix):
-                    prune = True
-                    break
-        if not prune:
+        if not _should_prune(mp, fstype):
             continue
         rc = _libc.umount2(mp.encode(), MNT_DETACH)
         err = ctypes.get_errno() if rc != 0 else 0

@@ -178,6 +178,7 @@ sledgehammer prefix).
 | `/run/snapd/ns/*.mnt` | Bind mounts of snap process mount-namespaces (nsfs files). Classic CRIU "external slavery" trigger. Only the `ns/` subtree is targeted — `/run/snapd.socket` (the snap CLI control socket, which lives directly in `/run`) stays reachable, so `snap install` continues to work. |
 | `/run/user/<uid>/doc`, `/run/user/<uid>/gvfs` (only when type matches `fuse.*`) | xdg-document-portal and gvfsd-fuse mounts whose backing daemons live outside our namespace and cannot survive into it. Targeted by **(path prefix, fstype prefix)** so the user's own fuse mounts (sshfs to a project dir, encfs, archivemount, etc.) are NOT touched. |
 | `/proc` | We unmount and re-mount with `mount -t proc proc /proc` so PIDs visible in `/proc/<n>/` match the `unshare(CLONE_NEWPID)` view. |
+| `/var/lib/docker/overlay2/opaque-bug-check*` | dockerd's overlay2-driver self-test mount, created and torn down (backing dirs included) within milliseconds of daemon startup. If a tab's namespace happens to be created while it briefly exists, it's inherited and baked into every future dump for that tab — and by restore time the backing directories are already deleted, so `criu restore` fails with `ENOENT` trying to recreate the overlay. Matched by (parent dir, basename prefix), since the random suffix differs every dockerd start. |
 
 That's the entire prune set. Nothing else gets touched.
 
@@ -371,7 +372,31 @@ confusing.
 detectable failure, distinct from "alive but wedged" — see limitations
 below), the tab's `pending_restart` is synthesized from the saved
 `criu_spawn_argv`/`criu_spawn_cwd` layout fields and the same banner +
-restart-fresh path runs.
+restart-fresh path runs. This is a "restore as much as possible"
+design: even when the checkpoint itself can't be used, the tab still
+comes back in the right window/pane position, in its original working
+directory, running its original command line — just as a fresh process
+instead of a resumed one.
+
+**A restore-time failure must never take other tabs down with it.**
+Each tab's restore is independent; a failure in one tab's `criu
+restore` is caught (`_CriuOperationError`) and turned into the
+restart-fresh path above for that tab alone, while sibling tabs
+continue their own spawn/restore normally. A bug here previously broke
+this isolation at the process level, not the Python level — see below.
+
+**Cross-tab crash on restore failure (fixed).** The cleanup path after
+a failed `criu restore` used to call `self.vte.set_pty(None)` on the
+foreign PTY it had allocated. VTE 0.76 segfaults natively when
+`set_pty(None)` is called on a foreign PTY that never had a child
+attached — no observable Python exception, the C side just dies. Since
+this is a real process crash (`SIGSEGV`), it took down the *entire*
+`terminator` process, killing every other tab in the window — including
+ones with no CRIU involvement at all that just happened to be mid-spawn
+in the same layout-restore pass. `_spawn_via_criu_helper`'s equivalent
+failure path already worked around this (transition to a fresh
+VTE-allocated PTY instead of `None`); the restore path now does the
+same.
 
 **Manual close of a wedged tab.** When the user right-clicks → Close
 on a CRIU tab whose program isn't responding (e.g. a wedged restored

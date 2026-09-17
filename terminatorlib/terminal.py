@@ -2504,10 +2504,19 @@ class Terminal(Gtk.VBox):
         try:
             result = _criu_client.restore(ckpt_dir, slave_path)
         except _CriuOperationError as e:
+            # AVOID `set_pty(None)` — it segfaults inside VTE 0.76 when
+            # the foreign PTY never had a child attached (no observable
+            # Python exception, the C side just dies), exactly like the
+            # spawn-failure path above. A failed restore never attaches
+            # a child either, so the same crash applies here. Transition
+            # to a fresh VTE-allocated PTY instead, which sidesteps the
+            # bad None-transition path entirely.
             try:
-                self.vte.set_pty(None)
-            except Exception:
-                pass
+                fresh_pty = Vte.Pty.new_sync(Vte.PtyFlags.DEFAULT, None)
+                self.vte.set_pty(fresh_pty)
+            except Exception as detach_err:
+                err('CRIU restore cleanup: fresh PTY swap failed: %s'
+                    % detach_err)
             os.close(master_fd)
             self._feed_error(
                 'CRIU restore failed: %s\r\nSpawning a fresh tab instead.'
