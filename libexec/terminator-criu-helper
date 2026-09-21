@@ -162,6 +162,10 @@ def set_pdeathsig(sig: int) -> None:
 _PRUNE_PREFIXES = (
     "/sys/fs/cgroup",
     "/run/snapd/ns",
+    # Docker's per-container network-namespace bind mounts. /run is a
+    # tmpfs, so these files vanish on reboot (or when the container
+    # exits); see _PRUNE_BY_PREFIX_AND_SUFFIX for the rest of docker.
+    "/run/docker/netns",
     # /proc intentionally NOT pruned — keep the inherited host /proc.
 )
 
@@ -191,6 +195,20 @@ _PRUNE_BY_PREFIX_AND_TYPE = (
 # random suffix is different every dockerd start.
 _PRUNE_BY_PARENT_AND_BASENAME_PREFIX = (
     ("/var/lib/docker/overlay2/", "opaque-bug-check"),
+)
+
+# Per-container docker mounts: the overlay2 rootfs
+# (/var/lib/docker/overlay2/<id>/merged) and the container's shm
+# (/var/lib/docker/containers/<id>/mounts/shm). They exist only while
+# the container runs. A tab whose namespace is created (or dumped)
+# while any container is up bakes them into its checkpoint, and after
+# a reboot or container exit `criu restore` fails trying to recreate
+# them ("Can't bind-mount ... No such file or directory"). Matched by
+# (path prefix, path suffix) since the container id is random. The
+# tab itself never needs these; it talks to dockerd over its socket.
+_PRUNE_BY_PREFIX_AND_SUFFIX = (
+    ("/var/lib/docker/overlay2/", "/merged"),
+    ("/var/lib/docker/containers/", "/mounts/shm"),
 )
 
 
@@ -225,7 +243,7 @@ def _enumerate_mounts() -> list[tuple[str, str]]:
 def _should_prune(mp: str, fstype: str) -> bool:
     """Pure predicate: should this (mountpoint, fstype) pair be pruned?
 
-    Three filter rules apply:
+    Four filter rules apply:
       1. Mountpoint matches one of `_PRUNE_PREFIXES` (or is a child).
       2. Mountpoint is under one of `_PRUNE_BY_PREFIX_AND_TYPE`'s path
          prefixes AND its fstype starts with the configured fstype
@@ -234,6 +252,8 @@ def _should_prune(mp: str, fstype: str) -> bool:
          `_PRUNE_BY_PARENT_AND_BASENAME_PREFIX`'s path prefixes AND its
          basename starts with the configured prefix (e.g. dockerd's
          opaque-bug-check self-test mounts under /var/lib/docker/overlay2/).
+      4. Mountpoint starts with a `_PRUNE_BY_PREFIX_AND_SUFFIX` prefix
+         AND ends with its suffix (per-container docker mounts).
 
     Split out from `_prune_inherited_mounts` so it can be unit tested
     without root, a mount namespace, or CRIU installed.
@@ -244,6 +264,9 @@ def _should_prune(mp: str, fstype: str) -> bool:
         return True
     for path_prefix, type_prefix in _PRUNE_BY_PREFIX_AND_TYPE:
         if mp.startswith(path_prefix) and fstype.startswith(type_prefix):
+            return True
+    for path_prefix, suffix in _PRUNE_BY_PREFIX_AND_SUFFIX:
+        if mp.startswith(path_prefix) and mp.endswith(suffix):
             return True
     for parent, basename_prefix in _PRUNE_BY_PARENT_AND_BASENAME_PREFIX:
         if not mp.startswith(parent):

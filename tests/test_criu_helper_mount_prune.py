@@ -44,10 +44,17 @@ _loader.exec_module(_helper)
      "overlay", True),
     ("/var/lib/docker/overlay2/opaque-bug-check520673387/merged",
      "overlay", True),
-    # A real, non-self-test overlay2 layer must NOT be pruned — only
-    # the "opaque-bug-check*" basename prefix matches.
-    ("/var/lib/docker/overlay2/abcdef0123456789/merged", "overlay", False),
+    # Per-container docker mounts: gone after reboot, so baked-in
+    # copies make restore fail.
+    ("/var/lib/docker/overlay2/abcdef0123456789/merged", "overlay", True),
+    ("/var/lib/docker/containers/abcdef/mounts/shm", "tmpfs", True),
+    ("/run/docker/netns/883a0cadf556", "nsfs", True),
+    ("/run/docker/netns", "tmpfs", True),
+    # Docker's persistent state must NOT be pruned.
     ("/var/lib/docker/overlay2", "ext4", False),
+    ("/var/lib/docker", "ext4", False),
+    ("/run/docker.sock", "sockfs", False),
+    ("/run/docker", "tmpfs", False),
 ])
 def test_should_prune(mp, fstype, expected):
     assert _helper._should_prune(mp, fstype) is expected
