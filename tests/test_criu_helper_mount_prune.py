@@ -55,6 +55,13 @@ _loader.exec_module(_helper)
     ("/var/lib/docker", "ext4", False),
     ("/run/docker.sock", "sockfs", False),
     ("/run/docker", "tmpfs", False),
+
+    # Snap's per-revision squashfs binds: revision changes on every
+    # refresh/removal, so a baked-in mount can point at a gone revision.
+    ("/snap/firefox/8863", "squashfs", True),
+    ("/snap/core22/2437", "squashfs", True),
+    ("/snap", "tmpfs", True),
+    ("/snapshot", "ext4", False),
 ])
 def test_should_prune(mp, fstype, expected):
     assert _helper._should_prune(mp, fstype) is expected

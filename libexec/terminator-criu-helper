@@ -166,6 +166,12 @@ _PRUNE_PREFIXES = (
     # tmpfs, so these files vanish on reboot (or when the container
     # exits); see _PRUNE_BY_PREFIX_AND_SUFFIX for the rest of docker.
     "/run/docker/netns",
+    # Snap's per-revision squashfs bind mounts. The revision number in
+    # the path changes whenever that snap is refreshed or removed, so
+    # a mount baked into a checkpoint can point at a revision that no
+    # longer exists by restore time (e.g. /snap/firefox/8863 after an
+    # auto-refresh or reboot-triggered cleanup).
+    "/snap",
     # /proc intentionally NOT pruned — keep the inherited host /proc.
 )
 
@@ -244,7 +250,8 @@ def _should_prune(mp: str, fstype: str) -> bool:
     """Pure predicate: should this (mountpoint, fstype) pair be pruned?
 
     Four filter rules apply:
-      1. Mountpoint matches one of `_PRUNE_PREFIXES` (or is a child).
+      1. Mountpoint matches one of `_PRUNE_PREFIXES` (or is a child),
+         e.g. /sys/fs/cgroup, /run/snapd/ns, /run/docker/netns, /snap.
       2. Mountpoint is under one of `_PRUNE_BY_PREFIX_AND_TYPE`'s path
          prefixes AND its fstype starts with the configured fstype
          prefix (e.g. fuse mounts under /run/user/).
