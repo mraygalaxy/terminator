@@ -35,6 +35,7 @@ import glob
 import json
 import os
 import pwd
+import random
 import signal
 import subprocess
 import fcntl
@@ -362,11 +363,23 @@ def cmd_spawn(uid: int, gid: int, slave_path: str, report_path: str,
     # counter, so serialize spawns with a lock held across the fork; a concurrent
     # system fork can still bump it (best-effort — we log if the result lands
     # low, and the EEXIST-on-restore path is the real safety net).
+    #
+    # Jitter the landing spot within the band instead of always resetting to
+    # the same _HIGH_PID_BASE: tabs created close together (the common case —
+    # several tabs opened in one session, or all of them restoring right
+    # after a reboot) would otherwise land at near-identical sequential PIDs
+    # every time, baking that closeness into their dumps. Then on restore,
+    # one tab's live PID is likely to collide with another's exact dumped
+    # target. Spreading the starting point decorrelates sibling tabs' PIDs
+    # so that kind of collision becomes a rare coincidence instead of the
+    # near-default outcome. Leave headroom below pid_max (2**22) for the
+    # kernel to walk forward from wherever we land.
+    _steer_pid = _HIGH_PID_BASE + random.SystemRandom().randrange(0, 90000)
     _steer_lock = open(_SPAWN_LOCK_PATH, "w")
     fcntl.flock(_steer_lock, fcntl.LOCK_EX)
     try:
         with open("/proc/sys/kernel/ns_last_pid", "w") as _nlp:
-            _nlp.write(str(_HIGH_PID_BASE))
+            _nlp.write(str(_steer_pid))
     except OSError as _e:
         print(f"ns_last_pid steer failed: {_e} (PID will be unbanded)",
               file=sys.stderr, flush=True)
